@@ -73,6 +73,14 @@ dp = Dispatcher(storage=MemoryStorage())
 BOT_START_TIME = datetime.now()
 
 bot_scripts = {}
+_bot_start_lock = asyncio.Lock()
+
+def _project_id(user_id: int, file_name: str) -> str:
+    digest = hashlib.sha256(f"{user_id}:{file_name}".encode()).hexdigest()[:12]
+    return f"{re.sub(r'[^A-Za-z0-9_-]', '_', Path(file_name).stem)[:32]}_{digest}"
+
+def _project_workspace(user_id: int, file_name: str) -> Path:
+    return UPLOAD_BOTS_DIR / str(user_id) / "projects" / _project_id(user_id, file_name)
 user_subscriptions = {}
 user_files = {}
 user_favorites = {}
@@ -893,6 +901,10 @@ async def handle_document(message: types.Message):
     safe_stem = re.sub(r"[^A-Za-z0-9_. -]", "_", Path(original_name).stem)[:34].strip(" ._") or "uploaded"
     file_name = safe_stem + original_suffix
     file_ext = original_suffix
+    # Keep repeated uploads as separate projects instead of overwriting an existing bot.
+    if (UPLOAD_BOTS_DIR / str(user_id) / file_name).exists():
+        suffix = hashlib.sha256(f"{user_id}:{document.file_unique_id}:{time.time_ns()}".encode()).hexdigest()[:6]
+        file_name = f"{safe_stem[:26]}_{suffix}{original_suffix}"
     
     if file_ext not in ['.py', '.zip']:
         await message.answer("❌ Only Python .py files and complete Python .zip projects are supported!")
@@ -1076,92 +1088,95 @@ def _project_control_keyboard(script_key, file_name):
 
 
 async def _start_python_process(user_id, display_name, entry_file: Path, working_dir: Path, project_type: str, callback):
-    script_key = f"{user_id}_{display_name}"
-    if script_key in bot_scripts:
-        old = bot_scripts[script_key].get('process')
-        if old and old.poll() is None:
-            await callback.message.answer("⚠️ This bot is already running!")
-            return
-        bot_scripts.pop(script_key, None)
+    # Serialize start requests so rapid/double taps cannot race process registration.
+    async with _bot_start_lock:
+        script_key = f"{user_id}_{_project_id(user_id, display_name)}"
+        old = bot_scripts.get(script_key)
+        if old:
+            old_process = old.get('process')
+            if old_process and old_process.poll() is None:
+                await callback.message.answer("⚠️ This project is already running. Use Restart or Stop first.")
+                return
+            old_handle = old.get('log_file')
+            if old_handle and not old_handle.closed:
+                old_handle.close()
+            bot_scripts.pop(script_key, None)
 
-    log_path = UPLOAD_BOTS_DIR / str(user_id) / f"{Path(display_name).stem}.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    started = datetime.now()
-    log_handle = open(log_path, 'a', encoding='utf-8', errors='replace')
-    log_handle.write(f"\n\n===== START {started.isoformat()} | {display_name} =====\n")
-    log_handle.flush()
-    status_msg = await callback.message.answer("⏳ <b>Preparing Python bot...</b>", parse_mode="HTML")
-    try:
-        requirements = working_dir / 'requirements.txt'
-        if not requirements.exists() and project_type == 'zip':
-            nested_requirements = sorted(working_dir.rglob('requirements.txt'))
-            if nested_requirements:
-                requirements = nested_requirements[0]
-        if requirements.exists():
-            await status_msg.edit_text("📦 <b>Installing requirements.txt...</b>", parse_mode="HTML")
-            def _install_requirements():
-                return subprocess.run([sys.executable, '-m', 'pip', 'install', '-r', str(requirements), '--break-system-packages', '--quiet'],
-                                      cwd=str(requirements.parent), capture_output=True, text=True, timeout=300)
-            result = await asyncio.to_thread(_install_requirements)
-            if result.returncode != 0:
-                log_handle.write("\n[DEPENDENCY INSTALL ERROR]\n" + (result.stderr or result.stdout or "pip install failed")[-12000:] + "\n")
-                log_handle.flush()
-                raise RuntimeError("requirements.txt install failed. View Logs for details.")
-            log_handle.write("[DEPENDENCIES] requirements.txt installed successfully\n")
-        elif project_type == 'py':
-            await status_msg.edit_text("📦 <b>Checking Python dependencies...</b>", parse_mode="HTML")
-            installed, failed = await asyncio.to_thread(install_missing_dependencies, entry_file)
-            if installed:
-                log_handle.write("[AUTO-INSTALLER] Installed: " + ', '.join(installed) + "\n")
-            if failed:
-                log_handle.write("[AUTO-INSTALLER] Failed: " + ', '.join(failed) + "\n")
-
-        await status_msg.edit_text("🚀 <b>Starting Python bot...</b>", parse_mode="HTML")
-        process = subprocess.Popen(
-            [sys.executable, '-u', str(entry_file)], cwd=str(working_dir),
-            stdout=log_handle, stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL, close_fds=True, start_new_session=(os.name != 'nt')
-        )
-        await asyncio.sleep(1.2)
-        exit_code = process.poll()
-        if exit_code is not None:
-            log_handle.flush()
-            _record_run(user_id, display_name, project_type, 'FAILED', started, datetime.now(), exit_code, log_path)
-            excerpt = log_path.read_text(errors='replace')[-2500:]
-            log_handle.close()
-            await status_msg.edit_text(
-                "❌ <b>BOT START FAILED</b>\n"
-                f"Exit code: <code>{exit_code}</code>\n\n"
-                f"<pre>{html_lib.escape(excerpt[-3000:])}</pre>", parse_mode="HTML")
+        working_dir = working_dir.resolve()
+        entry_file = entry_file.resolve()
+        if not working_dir.is_dir() or working_dir not in entry_file.parents:
+            await callback.message.answer("❌ Project entry must be inside its isolated project folder.")
             return
 
-        bot_scripts[script_key] = {
-            'process': process, 'file_name': display_name, 'script_owner_id': user_id,
-            'start_time': started, 'user_folder': str(working_dir), 'type': 'py',
-            'log_file': log_handle, 'log_path': str(log_path), 'entry_file': str(entry_file),
-            'project_type': project_type
-        }
-        with sqlite3.connect(DATABASE_PATH) as conn:
-            conn.execute("UPDATE bot_stats SET stat_value = stat_value + 1 WHERE stat_name = 'total_runs'")
-        bot_stats['total_runs'] = bot_stats.get('total_runs', 0) + 1
-        _record_run(user_id, display_name, project_type, 'RUNNING', started, log_path=log_path)
-        await status_msg.edit_text(
-            f"✅ <b>BOT RUNNING SUCCESSFULLY</b>\n\n"
-            f"📄 Project: <code>{html_lib.escape(display_name)}</code>\n"
-            f"🐍 Entry: <code>{html_lib.escape(entry_file.name)}</code>\n"
-            f"🆔 PID: <code>{process.pid}</code>\n"
-            f"📂 Working folder: <code>{html_lib.escape(str(working_dir.name))}</code>",
-            reply_markup=_project_control_keyboard(script_key, display_name), parse_mode="HTML")
-    except Exception as exc:
-        log_handle.write(f"\n[HOST ERROR] {type(exc).__name__}: {exc}\n")
+        log_path = working_dir / "hostbot.log"
+        started = datetime.now()
+        log_handle = open(log_path, 'a', encoding='utf-8', errors='replace')
+        log_handle.write(f"\n\n===== START {started.isoformat()} | {display_name} =====\n")
         log_handle.flush()
-        if not log_handle.closed:
-            log_handle.close()
+        status_msg = await callback.message.answer("⏳ <b>Preparing isolated Python project...</b>", parse_mode="HTML")
         try:
-            await status_msg.edit_text(f"❌ <b>START ERROR</b>\n{html_lib.escape(str(exc))}\n\nUse Logs to inspect the error.", parse_mode="HTML")
-        except Exception:
-            pass
-        logger.error("Bot start failed for %s: %s", display_name, exc)
+            requirements = working_dir / 'requirements.txt'
+            if not requirements.exists() and project_type == 'zip':
+                nested_requirements = sorted(working_dir.rglob('requirements.txt'))
+                if nested_requirements:
+                    requirements = nested_requirements[0]
+            if requirements.exists():
+                await status_msg.edit_text("📦 <b>Installing project requirements...</b>", parse_mode="HTML")
+                def _install_requirements():
+                    return subprocess.run([sys.executable, '-m', 'pip', 'install', '-r', str(requirements), '--quiet'],
+                                          cwd=str(requirements.parent), capture_output=True, text=True, timeout=300)
+                result = await asyncio.to_thread(_install_requirements)
+                if result.returncode != 0:
+                    log_handle.write("\n[DEPENDENCY INSTALL ERROR]\n" + (result.stderr or result.stdout or "pip install failed")[-12000:] + "\n")
+                    log_handle.flush()
+                    raise RuntimeError("requirements.txt install failed. Open project Logs for details.")
+                log_handle.write("[DEPENDENCIES] requirements.txt installed successfully\n")
+
+            await status_msg.edit_text("🚀 <b>Starting Python bot in its own folder...</b>", parse_mode="HTML")
+            process = subprocess.Popen(
+                [sys.executable, '-u', str(entry_file)], cwd=str(working_dir),
+                stdout=log_handle, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL, close_fds=True, start_new_session=(os.name != 'nt')
+            )
+            await asyncio.sleep(1.5)
+            exit_code = process.poll()
+            if exit_code is not None:
+                log_handle.flush()
+                _record_run(user_id, display_name, project_type, 'FAILED', started, datetime.now(), exit_code, log_path)
+                excerpt = log_path.read_text(errors='replace')[-2500:]
+                log_handle.close()
+                await status_msg.edit_text(
+                    "❌ <b>BOT START FAILED</b>\n"
+                    f"Exit code: <code>{exit_code}</code>\n\n<pre>{html_lib.escape(excerpt[-3000:])}</pre>", parse_mode="HTML")
+                return
+
+            bot_scripts[script_key] = {
+                'process': process, 'file_name': display_name, 'script_owner_id': user_id,
+                'start_time': started, 'user_folder': str(working_dir), 'type': 'py',
+                'log_file': log_handle, 'log_path': str(log_path), 'entry_file': str(entry_file),
+                'project_type': project_type
+            }
+            with sqlite3.connect(DATABASE_PATH) as conn:
+                conn.execute("UPDATE bot_stats SET stat_value = stat_value + 1 WHERE stat_name = 'total_runs'")
+            bot_stats['total_runs'] = bot_stats.get('total_runs', 0) + 1
+            _record_run(user_id, display_name, project_type, 'RUNNING', started, log_path=log_path)
+            await status_msg.edit_text(
+                f"✅ <b>BOT RUNNING SUCCESSFULLY</b>\n\n"
+                f"📄 Project: <code>{html_lib.escape(display_name)}</code>\n"
+                f"🐍 Entry: <code>{html_lib.escape(entry_file.name)}</code>\n"
+                f"🆔 PID: <code>{process.pid}</code>\n"
+                f"📂 Isolated folder: <code>{html_lib.escape(working_dir.name)}</code>",
+                reply_markup=_project_control_keyboard(script_key, display_name), parse_mode="HTML")
+        except Exception as exc:
+            log_handle.write(f"\n[HOST ERROR] {type(exc).__name__}: {exc}\n")
+            log_handle.flush()
+            if not log_handle.closed:
+                log_handle.close()
+            try:
+                await status_msg.edit_text(f"❌ <b>START ERROR</b>\n{html_lib.escape(str(exc))}\n\nUse Logs to inspect the error.", parse_mode="HTML")
+            except Exception:
+                pass
+            logger.exception("Bot start failed for %s", display_name)
 
 
 @dp.callback_query(F.data.startswith("run_script:"))
@@ -1176,8 +1191,19 @@ async def callback_run_script(callback: types.CallbackQuery):
     if not file_path.is_file() or file_path.suffix.lower() != '.py':
         await callback.answer("❌ Only uploaded Python .py files can run directly. For ZIP use Run Bot Project.", show_alert=True)
         return
-    await callback.answer("⏳ Preparing Python bot...")
-    await _start_python_process(user_id, file_name, file_path, user_folder, 'py', callback)
+    await callback.answer("⏳ Preparing isolated Python project...")
+    project_dir = _project_workspace(user_id, file_name)
+    project_dir.mkdir(parents=True, exist_ok=True)
+    staged_entry = project_dir / file_name
+    shutil.copy2(file_path, staged_entry)
+    # Include common non-code sidecar files (config/database/assets) without mixing Python scripts or ZIP projects.
+    for item in user_folder.iterdir():
+        if item.is_file() and item.name != file_name and item.suffix.lower() not in ('.py', '.zip', '.log'):
+            try:
+                shutil.copy2(item, project_dir / item.name)
+            except OSError:
+                logger.warning("Could not stage sidecar file %s", item.name)
+    await _start_python_process(user_id, file_name, staged_entry, project_dir, 'py', callback)
 
 
 @dp.callback_query(F.data.startswith("run_project:"))
@@ -1192,7 +1218,7 @@ async def callback_run_project(callback: types.CallbackQuery):
     if not zip_path.is_file() or not zipfile.is_zipfile(zip_path):
         await callback.answer("❌ ZIP file not found or invalid", show_alert=True)
         return
-    project_dir = user_folder / (Path(zip_name).stem[:60] + '_project')
+    project_dir = _project_workspace(user_id, zip_name)
     try:
         await callback.answer("📦 Preparing ZIP project...")
         if not project_dir.exists():
@@ -1268,7 +1294,9 @@ async def callback_view_log(callback: types.CallbackQuery):
     file_name = callback.data.split(":", 1)[1]
     user_folder = UPLOAD_BOTS_DIR / str(user_id)
     file_stem = Path(file_name).stem
-    log_path = user_folder / f"{file_stem}.log"
+    log_path = _project_workspace(user_id, file_name) / 'hostbot.log'
+    if not log_path.exists():
+        log_path = user_folder / f"{file_stem}.log"
 
     if not log_path.exists():
         await callback.answer("❌ Koi log nahi mila. Pehle script run karo.", show_alert=True)
@@ -1276,8 +1304,9 @@ async def callback_view_log(callback: types.CallbackQuery):
 
     try:
         content = log_path.read_text(errors='replace').strip()
-        script_key = f"{user_id}_{file_name}"
-        running_note = "🟢 Status: Running" if script_key in bot_scripts and bot_scripts[script_key]["process"].poll() is None else "🔴 Status: Stopped/Exited"
+        matching = next((v for v in bot_scripts.values()
+                         if v.get('script_owner_id') == user_id and v.get('file_name') == file_name), None)
+        running_note = "🟢 Status: Running" if matching and matching["process"].poll() is None else "🔴 Status: Stopped/Exited"
 
         if not content:
             content = "(Abhi tak koi output nahi — script chup-chaap chal rahi hai)"
@@ -1367,7 +1396,7 @@ async def callback_reset_project(callback: types.CallbackQuery):
             h = info.get('log_file')
             if h and not h.closed: h.close()
             bot_scripts.pop(key, None)
-    project_dir = UPLOAD_BOTS_DIR / str(user_id) / (Path(name).stem[:60] + '_project')
+    project_dir = _project_workspace(user_id, name)
     if project_dir.exists():
         shutil.rmtree(project_dir, ignore_errors=True)
     await callback.answer("🧹 Extracted project reset. Original ZIP/file is kept.", show_alert=True)
@@ -1378,7 +1407,7 @@ async def callback_backup_project(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     name = callback.data.split(":", 1)[1]
     user_folder = UPLOAD_BOTS_DIR / str(user_id)
-    project_dir = user_folder / (Path(name).stem[:60] + '_project')
+    project_dir = _project_workspace(user_id, name)
     source = project_dir if project_dir.is_dir() else user_folder
     if not source.exists():
         await callback.answer("❌ Project files not found", show_alert=True); return
@@ -1409,7 +1438,7 @@ async def callback_backup_project(callback: types.CallbackQuery):
 async def callback_download_project_db(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     name = callback.data.split(":", 1)[1]
-    root = UPLOAD_BOTS_DIR / str(user_id) / (Path(name).stem[:60] + '_project')
+    root = _project_workspace(user_id, name)
     if not root.exists(): root = UPLOAD_BOTS_DIR / str(user_id)
     candidates = [x for x in root.rglob('*') if x.is_file() and (x.suffix.lower() in ('.db','.sqlite','.sqlite3','.json') or x.name.lower().endswith('.db-wal'))]
     if not candidates:
