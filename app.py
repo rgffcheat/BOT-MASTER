@@ -22,7 +22,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiohttp import web
 import aiohttp
 from pathlib import Path
-from dotenv import load_dotenv
+from dotenv import load_dotenv, dotenv_values
+import venv
+import socket
 
 load_dotenv()
 
@@ -1039,6 +1041,9 @@ def _extract_project_archive(zip_path: Path, project_dir: Path):
         if total_size > max_uncompressed:
             raise ValueError("ZIP expands beyond the 500 MB safety limit")
         for item in entries:
+            parts = Path(item.filename).parts
+            if any(part in ('.venv', 'venv', 'site-packages', '__pycache__', '.git') for part in parts):
+                continue
             if item.is_dir():
                 continue
             dest = _safe_child_path(project_dir, item.filename)
@@ -1087,6 +1092,103 @@ def _project_control_keyboard(script_key, file_name):
     ])
 
 
+def _project_env_and_ports(project_dir: Path, entry_file: Path, venv_dir: Path, log_handle):
+    """Build a child-only environment: never leak the Master Bot's credentials/PORT."""
+    env = os.environ.copy()
+    sensitive = {
+        'BOT_TOKEN', 'TELEGRAM_BOT_TOKEN', 'API_TOKEN', 'BOT_API_TOKEN',
+        'OWNER_ID', 'ADMIN_ID', 'YOUR_USERNAME', 'UPDATE_CHANNEL',
+        'PYTHONPATH', 'PORT', 'WEB_PORT', 'SERVER_PORT', 'API_PORT',
+        'HTTP_PORT', 'FLASK_RUN_PORT'
+    }
+    for key in list(env):
+        if key.upper() in sensitive or key.upper().endswith('_BOT_TOKEN'):
+            env.pop(key, None)
+
+    # Read only this uploaded project's .env files. The nearest file wins.
+    env_files = []
+    for candidate in (project_dir / '.env', entry_file.parent / '.env'):
+        if candidate.is_file() and candidate not in env_files:
+            env_files.append(candidate)
+    project_values = {}
+    for env_file in env_files:
+        try:
+            values = dotenv_values(env_file)
+            project_values.update({k: str(v) for k, v in values.items() if v is not None})
+        except Exception as exc:
+            log_handle.write(f"[ENV WARNING] Could not read {env_file.name}: {exc}\n")
+    env.update(project_values)
+
+    # Avoid accidentally launching a second copy of the Master Bot.
+    master_token = os.getenv('BOT_TOKEN', '').strip()
+    project_token = next((env.get(k, '').strip() for k in
+                          ('BOT_TOKEN', 'TELEGRAM_BOT_TOKEN', 'API_TOKEN', 'BOT_API_TOKEN')
+                          if env.get(k, '').strip()), '')
+    token_candidates = set(re.findall(r'\b\d{6,}:[A-Za-z0-9_-]{20,}\b', project_token))
+    try:
+        source = entry_file.read_text(errors='ignore')
+        token_candidates.update(re.findall(r'\b\d{6,}:[A-Za-z0-9_-]{20,}\b', source))
+    except Exception:
+        pass
+    if master_token and master_token in token_candidates:
+        raise RuntimeError(
+            'This project contains the same Telegram Bot Token as the Master Bot. '
+            'Use a different token for the uploaded bot; Telegram allows only one active getUpdates poller per token.'
+        )
+    token_fingerprint = hashlib.sha256(sorted(token_candidates)[0].encode()).hexdigest() if token_candidates else None
+
+    # Give each hosted project its own ports. PORT inherited from the Master host
+    # was making child web/API servers collide with the Master web server.
+    for key in ('PORT', 'WEB_PORT', 'SERVER_PORT', 'API_PORT', 'HTTP_PORT', 'FLASK_RUN_PORT'):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(('0.0.0.0', 0))
+            env[key] = str(sock.getsockname()[1])
+    env['PYTHONUNBUFFERED'] = '1'
+    env['PYTHONDONTWRITEBYTECODE'] = '1'
+    bin_dir = venv_dir / ('Scripts' if os.name == 'nt' else 'bin')
+    env['PATH'] = str(bin_dir) + os.pathsep + env.get('PATH', '')
+    return env, token_fingerprint
+
+
+def _ensure_project_venv(project_dir: Path, log_handle):
+    """Create a separate virtual environment for each uploaded project."""
+    venv_dir = project_dir / '.venv'
+    python_bin = venv_dir / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
+    if not python_bin.exists():
+        log_handle.write('[ENVIRONMENT] Creating isolated virtual environment...\n')
+        log_handle.flush()
+        venv.EnvBuilder(with_pip=True, clear=False).create(str(venv_dir))
+    return venv_dir, python_bin
+
+
+def _install_project_imports(project_dir: Path, python_bin: Path, log_handle, timeout=600):
+    """Best-effort install of imports for projects without requirements.txt, inside .venv only."""
+    modules = set()
+    for source_file in project_dir.rglob('*.py'):
+        if any(part in ('.venv', 'venv', 'site-packages', '__pycache__') for part in source_file.parts):
+            continue
+        modules.update(extract_imports(source_file))
+    local_names = {p.stem for p in project_dir.rglob('*.py')}
+    local_names.update(p.name for p in project_dir.iterdir() if p.is_dir())
+    packages = set()
+    for module in modules:
+        if module in STDLIB_MODULES or module in local_names or module == '__future__':
+            continue
+        packages.add(IMPORT_TO_PIP.get(module, module))
+    if not packages:
+        log_handle.write('[DEPENDENCIES] No external imports detected.\n')
+        return
+    log_handle.write('[DEPENDENCIES] Installing detected imports into this project .venv: ' + ', '.join(sorted(packages)) + '\n')
+    log_handle.flush()
+    result = subprocess.run([str(python_bin), '-m', 'pip', 'install', '--disable-pip-version-check', '--quiet', *sorted(packages)],
+                            cwd=str(project_dir), capture_output=True, text=True, timeout=timeout)
+    if result.returncode != 0:
+        log_handle.write('[DEPENDENCY INSTALL WARNING]\n' + (result.stderr or result.stdout or 'pip install failed')[-10000:] + '\n')
+        log_handle.flush()
+    else:
+        log_handle.write('[DEPENDENCIES] Detected imports installed successfully.\n')
+
+
 async def _start_python_process(user_id, display_name, entry_file: Path, working_dir: Path, project_type: str, callback):
     # Serialize start requests so rapid/double taps cannot race process registration.
     async with _bot_start_lock:
@@ -1104,7 +1206,7 @@ async def _start_python_process(user_id, display_name, entry_file: Path, working
 
         working_dir = working_dir.resolve()
         entry_file = entry_file.resolve()
-        if not working_dir.is_dir() or working_dir not in entry_file.parents:
+        if not working_dir.is_dir() or (entry_file != working_dir and working_dir not in entry_file.parents):
             await callback.message.answer("❌ Project entry must be inside its isolated project folder.")
             return
 
@@ -1113,37 +1215,47 @@ async def _start_python_process(user_id, display_name, entry_file: Path, working
         log_handle = open(log_path, 'a', encoding='utf-8', errors='replace')
         log_handle.write(f"\n\n===== START {started.isoformat()} | {display_name} =====\n")
         log_handle.flush()
-        status_msg = await callback.message.answer("⏳ <b>Preparing isolated Python project...</b>", parse_mode="HTML")
+        status_msg = await callback.message.answer("⏳ <b>Preparing isolated Python environment...</b>", parse_mode="HTML")
         try:
+            venv_dir, python_bin = await asyncio.to_thread(_ensure_project_venv, working_dir, log_handle)
             requirements = working_dir / 'requirements.txt'
             if not requirements.exists() and project_type == 'zip':
                 nested_requirements = sorted(working_dir.rglob('requirements.txt'))
                 if nested_requirements:
                     requirements = nested_requirements[0]
             if requirements.exists():
-                await status_msg.edit_text("📦 <b>Installing project requirements...</b>", parse_mode="HTML")
+                await status_msg.edit_text("📦 <b>Installing this project's requirements in its own environment...</b>", parse_mode="HTML")
                 def _install_requirements():
-                    return subprocess.run([sys.executable, '-m', 'pip', 'install', '-r', str(requirements), '--quiet'],
-                                          cwd=str(requirements.parent), capture_output=True, text=True, timeout=300)
+                    return subprocess.run([str(python_bin), '-m', 'pip', 'install', '-r', str(requirements), '--disable-pip-version-check', '--quiet'],
+                                          cwd=str(requirements.parent), capture_output=True, text=True, timeout=600)
                 result = await asyncio.to_thread(_install_requirements)
                 if result.returncode != 0:
                     log_handle.write("\n[DEPENDENCY INSTALL ERROR]\n" + (result.stderr or result.stdout or "pip install failed")[-12000:] + "\n")
                     log_handle.flush()
-                    raise RuntimeError("requirements.txt install failed. Open project Logs for details.")
-                log_handle.write("[DEPENDENCIES] requirements.txt installed successfully\n")
+                    raise RuntimeError("requirements.txt install failed in this project's isolated environment. Open Live Logs for details.")
+                log_handle.write("[DEPENDENCIES] requirements.txt installed in project .venv\n")
+            else:
+                await status_msg.edit_text("🔎 <b>Checking Python imports and preparing dependencies...</b>", parse_mode="HTML")
+                await asyncio.to_thread(_install_project_imports, working_dir, python_bin, log_handle)
 
-            await status_msg.edit_text("🚀 <b>Starting Python bot in its own folder...</b>", parse_mode="HTML")
+            child_env, token_fingerprint = _project_env_and_ports(working_dir, entry_file, venv_dir, log_handle)
+            if token_fingerprint:
+                for active_key, active_info in bot_scripts.items():
+                    if active_key != script_key and active_info.get('token_fingerprint') == token_fingerprint and active_info.get('process') and active_info['process'].poll() is None:
+                        raise RuntimeError('Another hosted project is already using this Telegram Bot Token. Each running bot needs its own unique token.')
+            run_cwd = requirements.parent if requirements.exists() else entry_file.parent
+            await status_msg.edit_text("🚀 <b>Starting uploaded bot with its own Python environment...</b>", parse_mode="HTML")
             process = subprocess.Popen(
-                [sys.executable, '-u', str(entry_file)], cwd=str(working_dir),
+                [str(python_bin), '-u', str(entry_file)], cwd=str(run_cwd), env=child_env,
                 stdout=log_handle, stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL, close_fds=True, start_new_session=(os.name != 'nt')
             )
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(2.5)
             exit_code = process.poll()
             if exit_code is not None:
                 log_handle.flush()
                 _record_run(user_id, display_name, project_type, 'FAILED', started, datetime.now(), exit_code, log_path)
-                excerpt = log_path.read_text(errors='replace')[-2500:]
+                excerpt = log_path.read_text(errors='replace')[-3000:]
                 log_handle.close()
                 await status_msg.edit_text(
                     "❌ <b>BOT START FAILED</b>\n"
@@ -1154,18 +1266,21 @@ async def _start_python_process(user_id, display_name, entry_file: Path, working
                 'process': process, 'file_name': display_name, 'script_owner_id': user_id,
                 'start_time': started, 'user_folder': str(working_dir), 'type': 'py',
                 'log_file': log_handle, 'log_path': str(log_path), 'entry_file': str(entry_file),
-                'project_type': project_type
+                'project_type': project_type, 'python_bin': str(python_bin), 'run_cwd': str(run_cwd),
+                'token_fingerprint': token_fingerprint
             }
             with sqlite3.connect(DATABASE_PATH) as conn:
                 conn.execute("UPDATE bot_stats SET stat_value = stat_value + 1 WHERE stat_name = 'total_runs'")
             bot_stats['total_runs'] = bot_stats.get('total_runs', 0) + 1
             _record_run(user_id, display_name, project_type, 'RUNNING', started, log_path=log_path)
             await status_msg.edit_text(
-                f"✅ <b>BOT RUNNING SUCCESSFULLY</b>\n\n"
+                f"✅ <b>PROCESS STARTED</b>\n\n"
                 f"📄 Project: <code>{html_lib.escape(display_name)}</code>\n"
                 f"🐍 Entry: <code>{html_lib.escape(entry_file.name)}</code>\n"
                 f"🆔 PID: <code>{process.pid}</code>\n"
-                f"📂 Isolated folder: <code>{html_lib.escape(working_dir.name)}</code>",
+                f"📂 Workspace: <code>{html_lib.escape(str(working_dir))}</code>\n"
+                f"🐍 Environment: <code>.venv (isolated)</code>\n"
+                f"ℹ️ Check Live Logs to confirm the bot's own Telegram polling/service is ready.",
                 reply_markup=_project_control_keyboard(script_key, display_name), parse_mode="HTML")
         except Exception as exc:
             log_handle.write(f"\n[HOST ERROR] {type(exc).__name__}: {exc}\n")
@@ -1411,18 +1526,20 @@ async def callback_backup_project(callback: types.CallbackQuery):
     source = project_dir if project_dir.is_dir() else user_folder
     if not source.exists():
         await callback.answer("❌ Project files not found", show_alert=True); return
-    backup_path = user_folder / f"{Path(name).stem}_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+    backup_dir = project_dir / 'backups'
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_path = backup_dir / f"{Path(name).stem}_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
     try:
         def _make_backup():
             with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as zf:
                 if source == user_folder and Path(name).suffix.lower() == '.py':
-                    selected = [user_folder / name, user_folder / 'requirements.txt']
+                    selected = [user_folder / name]
                 else:
                     selected = list(source.rglob('*'))
                 for item in selected:
                     if (item.is_file() and item.exists() and item.resolve() != backup_path.resolve()
                             and item.suffix.lower() != '.log'
-                            and not any(part in ('__pycache__', '.venv', 'venv') for part in item.parts)):
+                            and not any(part in ('__pycache__', '.venv', 'venv', 'site-packages', 'backups') for part in item.parts)):
                         zf.write(item, item.relative_to(source))
         await asyncio.to_thread(_make_backup)
         await callback.message.answer_document(FSInputFile(backup_path), caption="💾 Project backup (source + database files)")
@@ -1442,7 +1559,7 @@ async def callback_download_project_db(callback: types.CallbackQuery):
     if not root.exists(): root = UPLOAD_BOTS_DIR / str(user_id)
     candidates = [x for x in root.rglob('*') if x.is_file() and (x.suffix.lower() in ('.db','.sqlite','.sqlite3','.json') or x.name.lower().endswith('.db-wal'))]
     if not candidates:
-        await callback.answer("No SQLite database file found in this project", show_alert=True); return
+        await callback.answer("No .db/.sqlite/.sqlite3/.json database file found in this project", show_alert=True); return
     for db_file in candidates[:5]:
         await callback.message.answer_document(FSInputFile(db_file), caption=f"🗄️ {db_file.name}")
     await callback.answer("✅ Database file(s) sent")
