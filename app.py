@@ -10,6 +10,10 @@ import sqlite3
 import hashlib
 import json
 import zipfile
+import shutil
+import signal
+import time
+import html as html_lib
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -135,6 +139,10 @@ def init_db():
         
         for stat in ['total_uploads', 'total_downloads', 'total_runs']:
             c.execute('INSERT OR IGNORE INTO bot_stats (stat_name, stat_value) VALUES (?, 0)', (stat,))
+        c.execute('''CREATE TABLE IF NOT EXISTS bot_run_history
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, file_name TEXT,
+                      project_type TEXT, status TEXT, started_at TEXT, finished_at TEXT,
+                      exit_code INTEGER, log_path TEXT)''')
         
         conn.commit()
         conn.close()
@@ -315,10 +323,10 @@ def build_welcome_text(user_id: int, full_name: str) -> str:
 ━━━━━━━━━━━━━━━━━━━━
 <b>🔥 AVAILABLE FEATURES</b>
 
-📤 <b>Upload Files</b> — Python, JS, ZIP
+📤 <b>Upload Files</b> — Python (.py), ZIP Python projects
 📁 <b>Manage Files</b> — View, delete, organize
 🔍 <b>Search Files</b> — Find by name/type
-▶️ <b>Run Scripts</b> — Execute Python/Node.js
+▶️ <b>Run Scripts</b> — Execute Python
 🛑 <b>Stop Scripts</b> — Force stop running
 📊 <b>View Stats</b> — Usage & storage
 ⚡ <b>Speed Test</b> — Bot response time
@@ -392,7 +400,7 @@ async def callback_upload_file(callback: types.CallbackQuery):
 
 📝 <b>Supported Formats:</b>
 🐍 Python (.py)
-🟨 JavaScript (.js)
+
 📦 ZIP Archives (.zip)
 
 ━━━━━━━━━━━━━━━━━━━━
@@ -447,8 +455,10 @@ Upload your first file to get started! 🚀
             is_favorite = file_name in user_favorites.get(user_id, [])
             star = "⭐" if is_favorite else "☆"
             
+            run_callback = f"run_project:{file_name}" if file_type == 'zip' else f"run_script:{file_name}"
+            run_label = f"🚀 Run Bot {file_name[:13]}" if file_type == 'zip' else f"▶️ Run {file_name[:15]}"
             buttons.append([
-                InlineKeyboardButton(text=f"▶️ Run {file_name[:15]}", callback_data=f"run_script:{file_name}"),
+                InlineKeyboardButton(text=run_label, callback_data=run_callback),
                 InlineKeyboardButton(text=f"{star}", callback_data=f"toggle_fav:{file_name}")
             ])
             buttons.append([
@@ -488,8 +498,10 @@ Add files to favorites for quick access! 🚀
         buttons = []
         for i, file_name in enumerate(favorites, 1):
             text += f"{i}. ⭐ <code>{file_name}</code>\n"
+            fav_type = next((ft for fn, ft in user_files.get(user_id, []) if fn == file_name), 'py')
+            fav_callback = f"run_project:{file_name}" if fav_type == 'zip' else f"run_script:{file_name}"
             buttons.append([
-                InlineKeyboardButton(text=f"▶️ {file_name[:20]}", callback_data=f"run_script:{file_name}"),
+                InlineKeyboardButton(text=f"🚀 {file_name[:18]}", callback_data=fav_callback),
                 InlineKeyboardButton(text=f"❌", callback_data=f"toggle_fav:{file_name}")
             ])
         
@@ -513,7 +525,6 @@ async def callback_search_files(callback: types.CallbackQuery):
 
 <b>File Types:</b>
 🐍 Python: {sum(1 for f in files if f[1] == 'py')}
-🟨 JavaScript: {sum(1 for f in files if f[1] == 'js')}
 📦 ZIP: {sum(1 for f in files if f[1] == 'zip')}
 
 ━━━━━━━━━━━━━━━━━━━━
@@ -627,7 +638,7 @@ async def callback_help_info(callback: types.CallbackQuery):
 
 1️⃣ <b>Upload Files:</b>
    • Click 'Upload File'
-   • Send your .py, .js, or .zip file
+   • Send your .py or .zip Python project
    • File will be saved automatically
 
 2️⃣ <b>Run Scripts:</b>
@@ -673,12 +684,12 @@ async def callback_all_features(callback: types.CallbackQuery):
 
 <b>✨ FREE USER FEATURES (12+):</b>
 
-1. 📤 Upload Files (Python, JS, ZIP)
+1. 📤 Upload Files (Python (.py), ZIP Python projects)
 2. 📁 View & Manage Files
 3. ⭐ Add to Favorites
 4. 🔍 Search Files by Name
 5. ▶️ Run Python Scripts
-6. ▶️ Run JavaScript Scripts
+6. ▶️ Run Python Bots
 7. 🛑 Stop Running Scripts
 8. 📊 View Your Statistics
 9. ⚡ Bot Speed Test
@@ -877,11 +888,14 @@ async def handle_document(message: types.Message):
         return
     
     document = message.document
-    file_name = document.file_name
-    file_ext = os.path.splitext(file_name)[1].lower()
+    original_name = Path(document.file_name or "uploaded_file").name
+    original_suffix = Path(original_name).suffix.lower()
+    safe_stem = re.sub(r"[^A-Za-z0-9_. -]", "_", Path(original_name).stem)[:34].strip(" ._") or "uploaded"
+    file_name = safe_stem + original_suffix
+    file_ext = original_suffix
     
-    if file_ext not in ['.py', '.js', '.zip']:
-        await message.answer("❌ Only .py, .js, and .zip files are supported!")
+    if file_ext not in ['.py', '.zip']:
+        await message.answer("❌ Only Python .py files and complete Python .zip projects are supported!")
         return
     
     current_files = len(user_files.get(user_id, []))
@@ -954,10 +968,11 @@ async def handle_document(message: types.Message):
         
         if file_ext == '.zip':
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📦 Extract ZIP", callback_data=f"extract_zip:{file_name}"),
-                 InlineKeyboardButton(text="⭐ Add Favorite", callback_data=f"toggle_fav:{file_name}")],
-                [InlineKeyboardButton(text="ℹ️ File Info", callback_data=f"file_info:{file_name}"),
-                 InlineKeyboardButton(text="🗑️ Delete", callback_data=f"delete_file:{file_name}")],
+                [InlineKeyboardButton(text="🚀 Run Bot Project", callback_data=f"run_project:{file_name}"),
+                 InlineKeyboardButton(text="📦 Extract ZIP", callback_data=f"extract_zip:{file_name}")],
+                [InlineKeyboardButton(text="⭐ Add Favorite", callback_data=f"toggle_fav:{file_name}"),
+                 InlineKeyboardButton(text="ℹ️ File Info", callback_data=f"file_info:{file_name}")],
+                [InlineKeyboardButton(text="🗑️ Delete", callback_data=f"delete_file:{file_name}")],
                 [InlineKeyboardButton(text="📁 My Files", callback_data="check_files"),
                  InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")]
             ])
@@ -991,95 +1006,261 @@ async def handle_document(message: types.Message):
         logger.error(f"Error uploading file: {e}")
         await message.answer(f"❌ Upload failed: {str(e)}")
 
+def _safe_child_path(base: Path, relative: str) -> Path:
+    """Resolve an archive member and reject paths escaping the project directory."""
+    target = (base / relative).resolve()
+    root = base.resolve()
+    if target != root and root not in target.parents:
+        raise ValueError("Unsafe path in ZIP archive")
+    return target
+
+
+def _extract_project_archive(zip_path: Path, project_dir: Path):
+    """Safely extract a Python project while preserving its directory structure."""
+    max_files = 5000
+    max_uncompressed = 500 * 1024 * 1024
+    with zipfile.ZipFile(zip_path, 'r') as archive:
+        entries = archive.infolist()
+        if len(entries) > max_files:
+            raise ValueError("ZIP contains too many files (limit 5000)")
+        total_size = sum(item.file_size for item in entries)
+        if total_size > max_uncompressed:
+            raise ValueError("ZIP expands beyond the 500 MB safety limit")
+        for item in entries:
+            if item.is_dir():
+                continue
+            dest = _safe_child_path(project_dir, item.filename)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(item, 'r') as src, open(dest, 'wb') as dst:
+                shutil.copyfileobj(src, dst)
+
+
+def _find_project_entry(project_dir: Path) -> Path:
+    py_files = [x for x in project_dir.rglob('*.py') if x.is_file() and not any(part in ('__pycache__', '.venv', 'venv', 'site-packages') for part in x.parts)]
+    if not py_files:
+        raise FileNotFoundError("ZIP archive ke andar koi .py file nahi mili")
+    # Prefer conventional entry points, then a root-level Python file, then first nested file.
+    priority = ('main.py', 'bot.py', 'app.py', 'run.py', 'start.py', '__main__.py')
+    for name in priority:
+        matches = [x for x in py_files if x.name.lower() == name]
+        if matches:
+            return sorted(matches, key=lambda x: (len(x.parts), str(x).lower()))[0]
+    root_files = [x for x in py_files if x.parent == project_dir]
+    if root_files:
+        return sorted(root_files, key=lambda x: x.name.lower())[0]
+    return sorted(py_files, key=lambda x: (len(x.parts), str(x).lower()))[0]
+
+
+def _record_run(user_id, file_name, project_type, status, started_at, finished_at=None, exit_code=None, log_path=None):
+    try:
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            conn.execute("INSERT INTO bot_run_history (user_id,file_name,project_type,status,started_at,finished_at,exit_code,log_path) VALUES (?,?,?,?,?,?,?,?)",
+                (user_id, file_name, project_type, status, started_at.isoformat(),
+                 finished_at.isoformat() if finished_at else None, exit_code, str(log_path) if log_path else None))
+    except Exception:
+        logger.exception("Could not save bot run history")
+
+
+def _project_control_keyboard(script_key, file_name):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛑 Stop", callback_data=f"stop_script:{script_key}"),
+         InlineKeyboardButton(text="🔄 Restart", callback_data=f"restart_script:{script_key}")],
+        [InlineKeyboardButton(text="📊 Status", callback_data=f"bot_status:{script_key}"),
+         InlineKeyboardButton(text="📋 Live Logs", callback_data=f"view_log:{file_name}")],
+        [InlineKeyboardButton(text="🧹 Reset Project", callback_data=f"reset_project:{file_name}")],
+        [InlineKeyboardButton(text="💾 Backup ZIP", callback_data=f"backup_project:{file_name}"),
+         InlineKeyboardButton(text="🗄️ Download DB", callback_data=f"download_project_db:{file_name}")],
+        [InlineKeyboardButton(text="📜 Run History", callback_data=f"run_history:{file_name}"),
+         InlineKeyboardButton(text="📁 My Files", callback_data="check_files")]
+    ])
+
+
+async def _start_python_process(user_id, display_name, entry_file: Path, working_dir: Path, project_type: str, callback):
+    script_key = f"{user_id}_{display_name}"
+    if script_key in bot_scripts:
+        old = bot_scripts[script_key].get('process')
+        if old and old.poll() is None:
+            await callback.message.answer("⚠️ This bot is already running!")
+            return
+        bot_scripts.pop(script_key, None)
+
+    log_path = UPLOAD_BOTS_DIR / str(user_id) / f"{Path(display_name).stem}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    started = datetime.now()
+    log_handle = open(log_path, 'a', encoding='utf-8', errors='replace')
+    log_handle.write(f"\n\n===== START {started.isoformat()} | {display_name} =====\n")
+    log_handle.flush()
+    status_msg = await callback.message.answer("⏳ <b>Preparing Python bot...</b>", parse_mode="HTML")
+    try:
+        requirements = working_dir / 'requirements.txt'
+        if not requirements.exists() and project_type == 'zip':
+            nested_requirements = sorted(working_dir.rglob('requirements.txt'))
+            if nested_requirements:
+                requirements = nested_requirements[0]
+        if requirements.exists():
+            await status_msg.edit_text("📦 <b>Installing requirements.txt...</b>", parse_mode="HTML")
+            def _install_requirements():
+                return subprocess.run([sys.executable, '-m', 'pip', 'install', '-r', str(requirements), '--break-system-packages', '--quiet'],
+                                      cwd=str(requirements.parent), capture_output=True, text=True, timeout=300)
+            result = await asyncio.to_thread(_install_requirements)
+            if result.returncode != 0:
+                log_handle.write("\n[DEPENDENCY INSTALL ERROR]\n" + (result.stderr or result.stdout or "pip install failed")[-12000:] + "\n")
+                log_handle.flush()
+                raise RuntimeError("requirements.txt install failed. View Logs for details.")
+            log_handle.write("[DEPENDENCIES] requirements.txt installed successfully\n")
+        elif project_type == 'py':
+            await status_msg.edit_text("📦 <b>Checking Python dependencies...</b>", parse_mode="HTML")
+            installed, failed = await asyncio.to_thread(install_missing_dependencies, entry_file)
+            if installed:
+                log_handle.write("[AUTO-INSTALLER] Installed: " + ', '.join(installed) + "\n")
+            if failed:
+                log_handle.write("[AUTO-INSTALLER] Failed: " + ', '.join(failed) + "\n")
+
+        await status_msg.edit_text("🚀 <b>Starting Python bot...</b>", parse_mode="HTML")
+        process = subprocess.Popen(
+            [sys.executable, '-u', str(entry_file)], cwd=str(working_dir),
+            stdout=log_handle, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, close_fds=True, start_new_session=(os.name != 'nt')
+        )
+        await asyncio.sleep(1.2)
+        exit_code = process.poll()
+        if exit_code is not None:
+            log_handle.flush()
+            _record_run(user_id, display_name, project_type, 'FAILED', started, datetime.now(), exit_code, log_path)
+            excerpt = log_path.read_text(errors='replace')[-2500:]
+            log_handle.close()
+            await status_msg.edit_text(
+                "❌ <b>BOT START FAILED</b>\n"
+                f"Exit code: <code>{exit_code}</code>\n\n"
+                f"<pre>{html_lib.escape(excerpt[-3000:])}</pre>", parse_mode="HTML")
+            return
+
+        bot_scripts[script_key] = {
+            'process': process, 'file_name': display_name, 'script_owner_id': user_id,
+            'start_time': started, 'user_folder': str(working_dir), 'type': 'py',
+            'log_file': log_handle, 'log_path': str(log_path), 'entry_file': str(entry_file),
+            'project_type': project_type
+        }
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            conn.execute("UPDATE bot_stats SET stat_value = stat_value + 1 WHERE stat_name = 'total_runs'")
+        bot_stats['total_runs'] = bot_stats.get('total_runs', 0) + 1
+        _record_run(user_id, display_name, project_type, 'RUNNING', started, log_path=log_path)
+        await status_msg.edit_text(
+            f"✅ <b>BOT RUNNING SUCCESSFULLY</b>\n\n"
+            f"📄 Project: <code>{html_lib.escape(display_name)}</code>\n"
+            f"🐍 Entry: <code>{html_lib.escape(entry_file.name)}</code>\n"
+            f"🆔 PID: <code>{process.pid}</code>\n"
+            f"📂 Working folder: <code>{html_lib.escape(str(working_dir.name))}</code>",
+            reply_markup=_project_control_keyboard(script_key, display_name), parse_mode="HTML")
+    except Exception as exc:
+        log_handle.write(f"\n[HOST ERROR] {type(exc).__name__}: {exc}\n")
+        log_handle.flush()
+        if not log_handle.closed:
+            log_handle.close()
+        try:
+            await status_msg.edit_text(f"❌ <b>START ERROR</b>\n{html_lib.escape(str(exc))}\n\nUse Logs to inspect the error.", parse_mode="HTML")
+        except Exception:
+            pass
+        logger.error("Bot start failed for %s: %s", display_name, exc)
+
+
 @dp.callback_query(F.data.startswith("run_script:"))
 async def callback_run_script(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     file_name = callback.data.split(":", 1)[1]
-    
+    if Path(file_name).name != file_name or file_name in ('.', '..'):
+        await callback.answer("❌ Invalid file name", show_alert=True)
+        return
     user_folder = UPLOAD_BOTS_DIR / str(user_id)
     file_path = user_folder / file_name
-    
-    if not file_path.exists():
-        await callback.answer("❌ File not found!", show_alert=True)
+    if not file_path.is_file() or file_path.suffix.lower() != '.py':
+        await callback.answer("❌ Only uploaded Python .py files can run directly. For ZIP use Run Bot Project.", show_alert=True)
         return
-    
-    script_key = f"{user_id}_{file_name}"
-    
-    if script_key in bot_scripts:
-        await callback.answer("⚠️ Script is already running!", show_alert=True)
-        return
-    
-    file_ext = file_path.suffix.lower()
-    
-    try:
-        log_file_path = user_folder / f"{file_path.stem}.log"
-        log_file = open(log_file_path, 'w')
-        
-        if file_ext == '.py':
-            status_msg = await callback.message.answer("📦 <i>Checking dependencies...</i>", parse_mode="HTML")
-            installed, failed = install_missing_dependencies(file_path)
-            if installed:
-                log_file.write(f"[AUTO-INSTALLER] Installed: {', '.join(installed)}\n")
-            if failed:
-                log_file.write(f"[AUTO-INSTALLER] Failed to install: {', '.join(failed)}\n")
-            log_file.flush()
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
+    await callback.answer("⏳ Preparing Python bot...")
+    await _start_python_process(user_id, file_name, file_path, user_folder, 'py', callback)
 
-            process = subprocess.Popen(
-                [sys.executable, str(file_path)],
-                cwd=str(user_folder),
-                stdout=log_file,
-                stderr=log_file
-            )
-        elif file_ext == '.js':
-            process = subprocess.Popen(
-                ['node', str(file_path)],
-                cwd=str(user_folder),
-                stdout=log_file,
-                stderr=log_file
-            )
-        else:
-            log_file.close()
-            await callback.answer("❌ Cannot run this file type!", show_alert=True)
-            return
-        
-        bot_scripts[script_key] = {
-            'process': process,
-            'file_name': file_name,
-            'script_owner_id': user_id,
-            'start_time': datetime.now(),
-            'user_folder': str(user_folder),
-            'type': file_ext[1:],
-            'log_file': log_file
-        }
-        
-        conn = sqlite3.connect(DATABASE_PATH)
-        c = conn.cursor()
-        c.execute('UPDATE bot_stats SET stat_value = stat_value + 1 WHERE stat_name = ?', ('total_runs',))
-        conn.commit()
-        conn.close()
-        bot_stats['total_runs'] = bot_stats.get('total_runs', 0) + 1
-        
-        try:
-            await callback.answer(f"✅ Script started! (PID: {process.pid})", show_alert=True)
-        except Exception:
-            await callback.message.answer(f"✅ Script started! (PID: {process.pid})")
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🛑 Stop Script", callback_data=f"stop_script:{script_key}")],
-            [InlineKeyboardButton(text="📋 View Output", callback_data=f"view_log:{file_name}")],
-            [InlineKeyboardButton(text="📁 My Files", callback_data="check_files"),
-             InlineKeyboardButton(text="🏠 Home", callback_data="back_to_main")]
-        ])
-        
-        await callback.message.edit_reply_markup(reply_markup=keyboard)
-        
-    except Exception as e:
-        logger.error(f"Error running script: {e}")
-        await callback.answer(f"❌ Error: {str(e)}", show_alert=True)
+
+@dp.callback_query(F.data.startswith("run_project:"))
+async def callback_run_project(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    zip_name = callback.data.split(":", 1)[1]
+    if Path(zip_name).name != zip_name or not zip_name.lower().endswith('.zip'):
+        await callback.answer("❌ Invalid ZIP name", show_alert=True)
+        return
+    user_folder = UPLOAD_BOTS_DIR / str(user_id)
+    zip_path = user_folder / zip_name
+    if not zip_path.is_file() or not zipfile.is_zipfile(zip_path):
+        await callback.answer("❌ ZIP file not found or invalid", show_alert=True)
+        return
+    project_dir = user_folder / (Path(zip_name).stem[:60] + '_project')
+    try:
+        await callback.answer("📦 Preparing ZIP project...")
+        if not project_dir.exists():
+            project_dir.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(_extract_project_archive, zip_path, project_dir)
+        entry_file = _find_project_entry(project_dir)
+        await _start_python_process(user_id, zip_name, entry_file, project_dir, 'zip', callback)
+    except Exception as exc:
+        logger.exception("ZIP project preparation failed")
+        shutil.rmtree(project_dir, ignore_errors=True)
+        await callback.message.answer(f"❌ ZIP project error: {html_lib.escape(str(exc)[:180])}")
+
+
+@dp.callback_query(F.data.startswith("restart_script:"))
+async def callback_restart_script(callback: types.CallbackQuery):
+    script_key = callback.data.split(":", 1)[1]
+    info = bot_scripts.get(script_key)
+    if not info:
+        await callback.answer("❌ Bot is not running. Start it again from My Files.", show_alert=True)
+        return
+    if callback.from_user.id != info.get('script_owner_id') and callback.from_user.id not in admin_ids:
+        await callback.answer("❌ You cannot control another user's bot", show_alert=True)
+        return
+    await callback.answer("🔄 Restarting bot...")
+    owner = info['script_owner_id']
+    name = info['file_name']
+    entry = Path(info['entry_file'])
+    workdir = Path(info['user_folder'])
+    p = info['process']
+    try:
+        if p.poll() is None:
+            if os.name == 'nt':
+                p.terminate()
+            else:
+                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+        handle = info.get('log_file')
+        if handle and not handle.closed:
+            handle.close()
+        bot_scripts.pop(script_key, None)
+        await _start_python_process(owner, name, entry, workdir, info.get('project_type', 'py'), callback)
+    except Exception as exc:
+        await callback.answer(f"❌ Restart failed: {str(exc)[:150]}", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("bot_status:"))
+async def callback_bot_status(callback: types.CallbackQuery):
+    key = callback.data.split(":", 1)[1]
+    info = bot_scripts.get(key)
+    if not info:
+        await callback.answer("Bot is stopped or not found", show_alert=True)
+        return
+    if callback.from_user.id != info.get('script_owner_id') and callback.from_user.id not in admin_ids:
+        await callback.answer("Not allowed", show_alert=True)
+        return
+    process = info['process']
+    running = process.poll() is None
+    elapsed = int((datetime.now() - info['start_time']).total_seconds())
+    await callback.message.answer(
+        f"📊 <b>BOT STATUS</b>\nStatus: {'🟢 RUNNING' if running else '🔴 STOPPED'}\n"
+        f"PID: <code>{process.pid}</code>\nRuntime: <code>{elapsed}s</code>\n"
+        f"Exit code: <code>{process.poll() if process.poll() is not None else 'N/A'}</code>",
+        parse_mode="HTML", reply_markup=_project_control_keyboard(key, info['file_name']))
+    await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("view_log:"))
 async def callback_view_log(callback: types.CallbackQuery):
@@ -1096,7 +1277,7 @@ async def callback_view_log(callback: types.CallbackQuery):
     try:
         content = log_path.read_text(errors='replace').strip()
         script_key = f"{user_id}_{file_name}"
-        running_note = "🟢 Status: Running" if script_key in bot_scripts else "🔴 Status: Stopped/Exited"
+        running_note = "🟢 Status: Running" if script_key in bot_scripts and bot_scripts[script_key]["process"].poll() is None else "🔴 Status: Stopped/Exited"
 
         if not content:
             content = "(Abhi tak koi output nahi — script chup-chaap chal rahi hai)"
@@ -1107,10 +1288,10 @@ async def callback_view_log(callback: types.CallbackQuery):
     📋 <b>SCRIPT OUTPUT</b> 📋
 ╚═══════════════════════╝
 
-📄 <b>File:</b> <code>{file_name}</code>
+📄 <b>File:</b> <code>{html_lib.escape(file_name)}</code>
 {running_note}
 
-<pre>{content}</pre>"""
+<pre>{html_lib.escape(content)}</pre>"""
 
         back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Refresh", callback_data=f"view_log:{file_name}")],
@@ -1124,168 +1305,174 @@ async def callback_view_log(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("stop_script:"))
 async def callback_stop_script(callback: types.CallbackQuery):
     script_key = callback.data.split(":", 1)[1]
-    
-    if script_key not in bot_scripts:
-        await callback.answer("❌ Script not found or already stopped!", show_alert=True)
+    info = bot_scripts.get(script_key)
+    if not info:
+        await callback.answer("❌ Bot not running or already stopped", show_alert=True)
         return
-    
+    if callback.from_user.id != info.get('script_owner_id') and callback.from_user.id not in admin_ids:
+        await callback.answer("❌ You cannot control another user's bot", show_alert=True)
+        return
     try:
-        script_info = bot_scripts[script_key]
-        process = script_info['process']
-        log_file = script_info.get('log_file')
-        
-        if log_file and not log_file.closed:
-            log_file.close()
-        
-        parent = psutil.Process(process.pid)
-        children = parent.children(recursive=True)
-        
-        for child in children:
-            child.terminate()
-        
-        parent.terminate()
-        
-        del bot_scripts[script_key]
-        
-        await callback.answer("✅ Script stopped successfully!", show_alert=True)
-        
-        if callback.from_user.id in admin_ids:
-            await callback.message.edit_text("🛑 Script stopped!", parse_mode="HTML")
-        else:
-            await callback_back_to_main(callback)
-        
-    except Exception as e:
-        logger.error(f"Error stopping script: {e}")
-        await callback.answer(f"❌ Error: {str(e)}", show_alert=True)
+        process = info['process']
+        if process.poll() is None:
+            if os.name == 'nt':
+                process.terminate()
+            else:
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            try:
+                process.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                if os.name == 'nt':
+                    process.kill()
+                else:
+                    try: os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    except ProcessLookupError: pass
+                process.wait(timeout=3)
+        handle = info.get('log_file')
+        if handle and not handle.closed:
+            handle.flush(); handle.close()
+        _record_run(info['script_owner_id'], info['file_name'], info.get('project_type','py'),
+                    'STOPPED', info['start_time'], datetime.now(), process.returncode, info.get('log_path'))
+        bot_scripts.pop(script_key, None)
+        await callback.answer("🛑 Bot stopped successfully", show_alert=True)
+        await callback.message.answer(f"🛑 <b>{html_lib.escape(info['file_name'])}</b> stopped.",
+                                      reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                          [InlineKeyboardButton(text="▶️ Start Again", callback_data=(f"run_project:{info['file_name']}" if info.get('project_type') == 'zip' else f"run_script:{info['file_name']}"))],
+                                          [InlineKeyboardButton(text="📁 My Files", callback_data="check_files")]
+                                      ]), parse_mode="HTML")
+    except Exception as exc:
+        logger.exception("Error stopping script")
+        await callback.answer(f"❌ Stop error: {str(exc)[:150]}", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("reset_project:"))
+async def callback_reset_project(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    name = callback.data.split(":", 1)[1]
+    # Stop matching active process first.
+    for key, info in list(bot_scripts.items()):
+        if info.get('script_owner_id') == user_id and info.get('file_name') == name:
+            p = info['process']
+            if p.poll() is None:
+                try:
+                    if os.name == 'nt': p.terminate()
+                    else: os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                    p.wait(timeout=5)
+                except Exception:
+                    try: p.kill()
+                    except Exception: pass
+            h = info.get('log_file')
+            if h and not h.closed: h.close()
+            bot_scripts.pop(key, None)
+    project_dir = UPLOAD_BOTS_DIR / str(user_id) / (Path(name).stem[:60] + '_project')
+    if project_dir.exists():
+        shutil.rmtree(project_dir, ignore_errors=True)
+    await callback.answer("🧹 Extracted project reset. Original ZIP/file is kept.", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("backup_project:"))
+async def callback_backup_project(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    name = callback.data.split(":", 1)[1]
+    user_folder = UPLOAD_BOTS_DIR / str(user_id)
+    project_dir = user_folder / (Path(name).stem[:60] + '_project')
+    source = project_dir if project_dir.is_dir() else user_folder
+    if not source.exists():
+        await callback.answer("❌ Project files not found", show_alert=True); return
+    backup_path = user_folder / f"{Path(name).stem}_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+    try:
+        def _make_backup():
+            with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                if source == user_folder and Path(name).suffix.lower() == '.py':
+                    selected = [user_folder / name, user_folder / 'requirements.txt']
+                else:
+                    selected = list(source.rglob('*'))
+                for item in selected:
+                    if (item.is_file() and item.exists() and item.resolve() != backup_path.resolve()
+                            and item.suffix.lower() != '.log'
+                            and not any(part in ('__pycache__', '.venv', 'venv') for part in item.parts)):
+                        zf.write(item, item.relative_to(source))
+        await asyncio.to_thread(_make_backup)
+        await callback.message.answer_document(FSInputFile(backup_path), caption="💾 Project backup (source + database files)")
+        await callback.answer("✅ Backup created")
+    except Exception as exc:
+        await callback.answer(f"❌ Backup failed: {str(exc)[:150]}", show_alert=True)
+    finally:
+        try: backup_path.unlink(missing_ok=True)
+        except Exception: pass
+
+
+@dp.callback_query(F.data.startswith("download_project_db:"))
+async def callback_download_project_db(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    name = callback.data.split(":", 1)[1]
+    root = UPLOAD_BOTS_DIR / str(user_id) / (Path(name).stem[:60] + '_project')
+    if not root.exists(): root = UPLOAD_BOTS_DIR / str(user_id)
+    candidates = [x for x in root.rglob('*') if x.is_file() and (x.suffix.lower() in ('.db','.sqlite','.sqlite3','.json') or x.name.lower().endswith('.db-wal'))]
+    if not candidates:
+        await callback.answer("No SQLite database file found in this project", show_alert=True); return
+    for db_file in candidates[:5]:
+        await callback.message.answer_document(FSInputFile(db_file), caption=f"🗄️ {db_file.name}")
+    await callback.answer("✅ Database file(s) sent")
+
+
+@dp.callback_query(F.data.startswith("run_history:"))
+async def callback_run_history(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    name = callback.data.split(":", 1)[1]
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        rows = conn.execute("SELECT status,started_at,finished_at,exit_code FROM bot_run_history WHERE user_id=? AND file_name=? ORDER BY id DESC LIMIT 10", (user_id,name)).fetchall()
+    if not rows:
+        body = "No run history found yet."
+    else:
+        body = "\n".join(f"• {html_lib.escape(str(a))} | {html_lib.escape(str(b))} | exit={c if c is not None else '-'}" for a,b,_,c in rows)
+    await callback.message.answer(f"📜 <b>RUN HISTORY</b>\n<pre>{body[:3500]}</pre>", parse_mode="HTML")
+    await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("extract_zip:"))
 async def callback_extract_zip(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     file_name = callback.data.split(":", 1)[1]
-    
+    if Path(file_name).name != file_name:
+        await callback.answer("❌ Invalid ZIP name", show_alert=True)
+        return
     user_folder = UPLOAD_BOTS_DIR / str(user_id)
     zip_path = user_folder / file_name
-    
-    if not zip_path.exists():
-        await callback.answer("❌ ZIP file not found!", show_alert=True)
+    if not zip_path.is_file() or not zipfile.is_zipfile(zip_path):
+        await callback.answer("❌ ZIP file not found or invalid", show_alert=True)
         return
-    
-    if not zipfile.is_zipfile(zip_path):
-        await callback.answer("❌ Invalid ZIP file!", show_alert=True)
-        return
-    
+    project_dir = user_folder / (Path(file_name).stem[:60] + '_project')
     try:
-        status_text = f"""
-╔═══════════════════════╗
-    📦 <b>EXTRACTING ZIP</b> 📦
-╚═══════════════════════╝
-
-📄 File: <code>{file_name}</code>
-⏳ Status: <b>Extracting...</b>
-
-Please wait...
-"""
-        await callback.message.edit_text(status_text, parse_mode="HTML")
-        
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(user_folder)
-            all_files = zip_ref.namelist()
-        
-        registered_files = []
-        conn = sqlite3.connect(DATABASE_PATH)
-        c = conn.cursor()
-        now = datetime.now().isoformat()
-        
-        for extracted_file in all_files:
-            if extracted_file.endswith('/'):
-                continue
-            
-            file_path = Path(extracted_file)
-            file_ext = file_path.suffix.lower()
-            
-            if file_ext in ['.py', '.js']:
-                just_name = file_path.name
-                
-                # Agar file kisi subfolder mein extract hui hai, use root user_folder mein move karo
-                # taaki baad mein run karte waqt file mil jaye (registration sirf naam track karta hai)
-                extracted_full_path = user_folder / extracted_file
-                target_path = user_folder / just_name
-                if extracted_full_path.exists() and extracted_full_path != target_path:
-                    if not target_path.exists():
-                        extracted_full_path.rename(target_path)
-                        just_name = target_path.name
-                    else:
-                        # Naam already exist karta hai to unique bana do (overwrite se bachne ke liye)
-                        stem, suf = target_path.stem, target_path.suffix
-                        counter = 1
-                        new_target = user_folder / f"{stem}_{counter}{suf}"
-                        while new_target.exists():
-                            counter += 1
-                            new_target = user_folder / f"{stem}_{counter}{suf}"
-                        extracted_full_path.rename(new_target)
-                        just_name = new_target.name
-                
-                if user_id not in user_files:
-                    user_files[user_id] = []
-                
-                user_files[user_id].append((just_name, file_ext[1:]))
-                
-                c.execute('INSERT OR REPLACE INTO user_files (user_id, file_name, file_type, upload_date) VALUES (?, ?, ?, ?)',
-                          (user_id, just_name, file_ext[1:], now))
-                
-                registered_files.append(just_name)
-        
-        if user_id in user_files:
-            user_files[user_id] = [f for f in user_files[user_id] if f[0] != file_name]
-        
-        c.execute('DELETE FROM user_files WHERE user_id = ? AND file_name = ?', (user_id, file_name))
-        c.execute('DELETE FROM favorites WHERE user_id = ? AND file_name = ?', (user_id, file_name))
-        conn.commit()
-        conn.close()
-        
-        if zip_path.exists():
-            zip_path.unlink()
-        
-        registered_text = "\n".join([f"  • <code>{f}</code>" for f in registered_files[:10]])
-        if len(registered_files) > 10:
-            registered_text += f"\n  ... and {len(registered_files) - 10} more files"
-        elif len(registered_files) == 0:
-            registered_text = "  <i>No .py or .js files found</i>"
-        
-        current_count = len(user_files.get(user_id, []))
-        limit = get_user_file_limit(user_id)
-        
-        success_text = f"""
-╔═══════════════════════╗
-    ✅ <b>EXTRACTION SUCCESS!</b> ✅
-╚═══════════════════════╝
-
-📄 <b>ZIP File:</b> <code>{file_name}</code>
-📊 <b>Total Extracted:</b> {len(all_files)} files
-✅ <b>Registered:</b> {len(registered_files)} files (.py, .js)
-🗑️ <b>ZIP Deleted:</b> Automatically
-
-<b>📋 Registered Files:</b>
-{registered_text}
-
-📦 <b>Your Files:</b> {current_count} (Unlimited ♾️)
-
-✨ Extraction completed successfully!
-"""
-        
+        await callback.answer("📦 Safely extracting project...")
+        if project_dir.exists():
+            shutil.rmtree(project_dir, ignore_errors=True)
+        project_dir.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(_extract_project_archive, zip_path, project_dir)
+        py_count = sum(1 for item in project_dir.rglob('*.py') if item.is_file())
+        all_count = sum(1 for item in project_dir.rglob('*') if item.is_file())
+        try:
+            entry = _find_project_entry(project_dir)
+            entry_label = html_lib.escape(str(entry.relative_to(project_dir)))
+        except FileNotFoundError:
+            entry_label = "No Python entry file found"
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🚀 Run Bot Project", callback_data=f"run_project:{file_name}")],
             [InlineKeyboardButton(text="📁 My Files", callback_data="check_files"),
              InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")]
         ])
-        
-        await callback.message.edit_text(success_text, reply_markup=keyboard, parse_mode="HTML")
-        await callback.answer("✅ ZIP extracted & registered!")
-        
-    except zipfile.BadZipFile:
-        await callback.answer("❌ Corrupted ZIP file!", show_alert=True)
-    except Exception as e:
-        logger.error(f"Error extracting ZIP: {e}")
-        await callback.answer(f"❌ Extraction failed: {str(e)}", show_alert=True)
+        await callback.message.answer(
+            f"✅ <b>ZIP EXTRACTED SAFELY</b>\nFiles: <code>{all_count}</code>\n"
+            f"Python files: <code>{py_count}</code>\nEntry candidate: <code>{entry_label}</code>\n"
+            "Original ZIP and folder structure have been kept.",
+            reply_markup=keyboard, parse_mode="HTML")
+    except Exception as exc:
+        shutil.rmtree(project_dir, ignore_errors=True)
+        logger.exception("Safe ZIP extraction failed")
+        await callback.message.answer(f"❌ Extraction failed: {html_lib.escape(str(exc)[:200])}")
 
 @dp.callback_query(F.data.startswith("delete_file:"))
 async def callback_delete_file(callback: types.CallbackQuery):
@@ -1356,7 +1543,7 @@ async def callback_admin_total_files(callback: types.CallbackQuery):
     
     total_files = sum(len(files) for files in user_files.values())
     py_files = sum(1 for files in user_files.values() for f in files if f[1] == 'py')
-    js_files = sum(1 for files in user_files.values() for f in files if f[1] == 'js')
+    js_files = 0
     zip_files = sum(1 for files in user_files.values() for f in files if f[1] == 'zip')
     
     text = f"""
@@ -1368,7 +1555,6 @@ async def callback_admin_total_files(callback: types.CallbackQuery):
 
 <b>📦 By Type:</b>
 🐍 Python: {py_files}
-🟨 JavaScript: {js_files}
 📦 ZIP: {zip_files}
 
 <b>📈 Top Users:</b>
@@ -2113,7 +2299,7 @@ async def cmd_help(message: types.Message):
 
 1️⃣ <b>Upload Files:</b>
    • Click 'Upload File'
-   • Send your .py, .js, or .zip file
+   • Send your .py or .zip Python project
    • File will be saved automatically
 
 2️⃣ <b>Run Scripts:</b>
@@ -2433,7 +2619,7 @@ async def admin_page(request):
     return web.Response(text=ADMIN_HTML, content_type='text/html')
 
 LANDING_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Genius HostBot - Free Telegram Bot Hosting</title><meta name="description" content="Python aur Node.js bots ko Telegram se free mein host karo. Unlimited uploads, koi premium nahi.">
+<title>Genius HostBot - Free Telegram Bot Hosting</title><meta name="description" content="Python bots ko Telegram se host karo. Unlimited uploads, koi premium nahi.">
 <style>
 *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;font-family:system-ui,sans-serif;background:#070b12;color:#e6edf3;line-height:1.55}
 nav{display:flex;justify-content:space-between;align-items:center;padding:14px 22px;position:sticky;top:0;background:#070b12ee;backdrop-filter:blur(8px);border-bottom:1px solid #151d2c;z-index:5}
@@ -2453,11 +2639,11 @@ footer{text-align:center;color:#6b7785;padding:28px 10px;font-size:13px;border-t
 <nav><b>🚀 Genius <span>HostBot</span></b><div><a href="#features">Features</a><a href="#how">How it works</a><a href="#faq">FAQ</a></div></nav>
 <div class="hero"><div class="badge">🆓 100% Free &bull; Unlimited Uploads</div>
 <h1>Apne Bots ko <span>24/7</span> Host Karo<br>Seedha Telegram Se</h1>
-<p>Python (.py), Node.js (.js) ya ZIP file bhejo, dependencies khud install hongi aur bot chalu. Koi premium plan nahi, koi limit nahi.</p>
+<p>Python (.py),  ya ZIP file bhejo, dependencies khud install hongi aur bot chalu. Koi premium plan nahi, koi limit nahi.</p>
 <a class="btn p" href="__BOTLINK__">🚀 Start on Telegram</a><a class="btn s" href="__CHANNEL__">📢 Updates Channel</a></div>
 <div class="stats"><div class="st"><b>__USERS__</b><small>Users</small></div><div class="st"><b>__RUNNING__</b><small>Bots running now</small></div><div class="st"><b>__FILES__</b><small>Files hosted</small></div></div>
 <section id="features"><h2>Features</h2><div class="g">
-<div class="f"><h3>📤 Easy Upload</h3><p>.py, .js aur .zip files seedha Telegram chat se upload karo.</p></div>
+<div class="f"><h3>📤 Easy Upload</h3><p>.py aur .zip Python projects seedha Telegram chat se upload karo.</p></div>
 <div class="f"><h3>⚙️ Auto Install</h3><p>Zaroori Python packages apne aap install ho jate hain.</p></div>
 <div class="f"><h3>▶️ Run &amp; Stop</h3><p>Bot ke buttons se script start, stop aur manage karo.</p></div>
 <div class="f"><h3>📁 File Manager</h3><p>Files dekho, search karo, download aur delete karo.</p></div>
@@ -2465,11 +2651,11 @@ footer{text-align:center;color:#6b7785;padding:28px 10px;font-size:13px;border-t
 <div class="f"><h3>🆓 Totally Free</h3><p>Unlimited uploads, sabke liye same features.</p></div></div></section>
 <section id="how"><h2>Kaise use karein</h2>
 <div class="step"><div class="num">1</div><div><b>Bot kholo</b><br><span style="color:#9aa7b5">Telegram pe bot open karke /start dabao.</span></div></div>
-<div class="step"><div class="num">2</div><div><b>File upload karo</b><br><span style="color:#9aa7b5">Apni .py, .js ya .zip file bhejo.</span></div></div>
+<div class="step"><div class="num">2</div><div><b>File upload karo</b><br><span style="color:#9aa7b5">Apni .py ya .zip Python project file bhejo.</span></div></div>
 <div class="step"><div class="num">3</div><div><b>Run dabao</b><br><span style="color:#9aa7b5">Bot chalu, aur stop bhi kabhi bhi kar sakte ho.</span></div></div></section>
 <section id="faq"><h2>FAQ</h2>
 <details><summary>Kya ye sach mein free hai?</summary><p>Haan, koi premium plan ya upload limit nahi hai.</p></details>
-<details><summary>Kaunsi files chalti hain?</summary><p>Python (.py), Node.js (.js) aur ZIP projects.</p></details>
+<details><summary>Kaunsi files chalti hain?</summary><p>Python (.py) aur complete ZIP Python projects.</p></details>
 <details><summary>Problem aaye to?</summary><p>Telegram pe owner @Hackerwibes2 se contact karo.</p></details></section>
 <section><div class="cta"><h2 style="margin-bottom:8px">Ready to host? 🚀</h2><p style="color:#9aa7b5;margin:0 0 16px">Abhi Telegram pe bot kholo.</p><a class="btn p" href="__BOTLINK__">Open Bot</a></div></section>
 <footer>Developed by <b>Aditya (Genius Hacker)</b><br><a href="__YT__">YouTube</a>&bull;<a href="__CHANNEL__">Telegram Channel</a>&bull;<a href="https://t.me/__OWNER__">Contact</a></footer></body></html>"""
