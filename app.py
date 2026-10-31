@@ -46,8 +46,8 @@ except ValueError:
     logger.error("OWNER_ID or ADMIN_ID must be valid integers!")
     raise
 
-YOUR_USERNAME = '@Hackerwibes9'
-UPDATE_CHANNEL = 'https://t.me/geniushackertools'
+YOUR_USERNAME = '@RGCHEAT99'
+UPDATE_CHANNEL = 'https://t.me/+gxNKatV44H8xYWJl'
 YOUTUBE_CHANNEL = 'https://youtube.com/@geniushacker29'
 CHANNEL_USERNAME = '@' + UPDATE_CHANNEL.rstrip('/').split('/')[-1]
 
@@ -303,7 +303,7 @@ def get_admin_panel_keyboard():
 
 def build_welcome_text(user_id: int, full_name: str) -> str:
     return f"""╔═══════════════════════╗
-    🚀 <b>GENIUS HOSTBOT</b> 🚀
+    🚀 <b>RG CHEAT</b> 🚀
     ⚡ <i>Script Runner Bot</i>
 ╚═══════════════════════╝
 
@@ -326,9 +326,6 @@ def build_welcome_text(user_id: int, full_name: str) -> str:
 ℹ️ <b>Help &amp; Support</b> — Get assistance
 
 ━━━━━━━━━━━━━━━━━━━━
-📢 <b>Updates:</b> {UPDATE_CHANNEL}
-🎥 <b>YouTube:</b> {YOUTUBE_CHANNEL}
-
 ⚡ <b>Developed by</b> Aditya (Genius Hacker)
 🔒 <b>Version:</b> 2.0"""
 
