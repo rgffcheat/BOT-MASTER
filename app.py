@@ -19,6 +19,7 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramRetryAfter
 from aiohttp import web
 import aiohttp
 from pathlib import Path
@@ -66,6 +67,7 @@ FREE_USER_LIMIT = float('inf')
 SUBSCRIBED_USER_LIMIT = float('inf')
 ADMIN_LIMIT = 999
 OWNER_LIMIT = float('inf')
+USER_RUN_LIMIT = 2   # normal users: max 2 bots running at the same time (admins/owner: unlimited)
 
 UPLOAD_BOTS_DIR.mkdir(parents=True, exist_ok=True)
 IROTECH_DIR.mkdir(exist_ok=True)
@@ -329,6 +331,7 @@ def build_welcome_text(user_id: int, full_name: str) -> str:
 
 🆔 <b>Your ID:</b> <code>{user_id}</code>
 📦 <b>Upload Limit:</b> Unlimited ♾️
+🤖 <b>Running Bots:</b> {'Unlimited ♾️' if user_id in admin_ids else str(USER_RUN_LIMIT) + ' bots at a time'}
 
 ━━━━━━━━━━━━━━━━━━━━
 <b>🔥 AVAILABLE FEATURES</b>
@@ -344,7 +347,7 @@ def build_welcome_text(user_id: int, full_name: str) -> str:
 ℹ️ <b>Help &amp; Support</b> — Get assistance
 
 ━━━━━━━━━━━━━━━━━━━━
-⚡ <b>Developed by</b> Aditya (Genius Hacker)
+⚡ <b>Developed by</b> RG CHEAT
 🔒 <b>Version:</b> 2.0"""
 
 @dp.message(Command("start"))
@@ -903,6 +906,9 @@ async def handle_document(message: types.Message):
     safe_stem = re.sub(r"[^A-Za-z0-9_. -]", "_", Path(original_name).stem)[:34].strip(" ._") or "uploaded"
     file_name = safe_stem + original_suffix
     file_ext = original_suffix
+    if user_id in admin_ids and file_ext == '.zip' and original_name.upper().startswith('RG_FULL_BACKUP'):
+        await _restore_full_backup(message, document)
+        return
     # Keep repeated uploads as separate projects instead of overwriting an existing bot.
     if (UPLOAD_BOTS_DIR / str(user_id) / file_name).exists():
         suffix = hashlib.sha256(f"{user_id}:{document.file_unique_id}:{time.time_ns()}".encode()).hexdigest()[:6]
@@ -1204,6 +1210,14 @@ async def _start_python_process(user_id, display_name, entry_file: Path, working
                 old_handle.close()
             bot_scripts.pop(script_key, None)
 
+        if user_id not in admin_ids:
+            running_now = sum(1 for k, i in bot_scripts.items()
+                              if i.get('script_owner_id') == user_id and k != script_key
+                              and i.get('process') and i['process'].poll() is None)
+            if running_now >= USER_RUN_LIMIT:
+                await callback.message.answer(f"🚫 Limit reached: normal users can run only {USER_RUN_LIMIT} bots at a time. Stop one bot first.")
+                return
+
         working_dir = working_dir.resolve()
         entry_file = entry_file.resolve()
         if not working_dir.is_dir() or (entry_file != working_dir and working_dir not in entry_file.parents):
@@ -1248,7 +1262,8 @@ async def _start_python_process(user_id, display_name, entry_file: Path, working
             process = subprocess.Popen(
                 [str(python_bin), '-u', str(entry_file)], cwd=str(run_cwd), env=child_env,
                 stdout=log_handle, stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL, close_fds=True, start_new_session=(os.name != 'nt')
+                stdin=subprocess.DEVNULL, close_fds=True, start_new_session=(os.name != 'nt'),
+                preexec_fn=(_child_preexec if os.name != 'nt' else None)
             )
             await asyncio.sleep(2.5)
             exit_code = process.poll()
@@ -1269,6 +1284,7 @@ async def _start_python_process(user_id, display_name, entry_file: Path, working
                 'project_type': project_type, 'python_bin': str(python_bin), 'run_cwd': str(run_cwd),
                 'token_fingerprint': token_fingerprint
             }
+            _autostart_save(user_id, display_name, project_type)
             with sqlite3.connect(DATABASE_PATH) as conn:
                 conn.execute("UPDATE bot_stats SET stat_value = stat_value + 1 WHERE stat_name = 'total_runs'")
             bot_stats['total_runs'] = bot_stats.get('total_runs', 0) + 1
@@ -1481,6 +1497,7 @@ async def callback_stop_script(callback: types.CallbackQuery):
         _record_run(info['script_owner_id'], info['file_name'], info.get('project_type','py'),
                     'STOPPED', info['start_time'], datetime.now(), process.returncode, info.get('log_path'))
         bot_scripts.pop(script_key, None)
+        _autostart_remove(info['script_owner_id'], info['file_name'])
         await callback.answer("🛑 Bot stopped successfully", show_alert=True)
         await callback.message.answer(f"🛑 <b>{html_lib.escape(info['file_name'])}</b> stopped.",
                                       reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -1511,6 +1528,7 @@ async def callback_reset_project(callback: types.CallbackQuery):
             h = info.get('log_file')
             if h and not h.closed: h.close()
             bot_scripts.pop(key, None)
+            _autostart_remove(info.get('script_owner_id'), info.get('file_name'))
     project_dir = _project_workspace(user_id, name)
     if project_dir.exists():
         shutil.rmtree(project_dir, ignore_errors=True)
@@ -1632,6 +1650,11 @@ async def callback_delete_file(callback: types.CallbackQuery):
         if file_path.exists():
             file_path.unlink()
         
+        try:
+            _stop_script(_script_key(user_id, file_name))
+            _autostart_remove(user_id, file_name)
+        except Exception:
+            logger.exception('cleanup on delete failed')
         if user_id in user_files:
             user_files[user_id] = [f for f in user_files[user_id] if f[0] != file_name]
         
@@ -2623,6 +2646,10 @@ def _stop_script(key):
     except Exception:
         pass
     bot_scripts.pop(key, None)
+    try:
+        _autostart_remove(info.get('script_owner_id'), info.get('file_name'))
+    except Exception:
+        pass
     return True
 
 def _db(sql, params=()):
@@ -2728,7 +2755,7 @@ input,textarea{background:#0b0f17;color:#e6edf3;border:1px solid #30363d;border-
 <button class="nav on" data-p="over">📊 Overview</button><button class="nav" data-p="bots">🤖 Running Bots</button>
 <button class="nav" data-p="files">📁 All Files</button><button class="nav" data-p="users">👥 Users</button>
 <button class="nav" data-p="cast">📢 Broadcast</button><button class="nav" data-p="set">⚙️ Settings</button>
-<a class="nav" href="/" style="text-decoration:none">🌐 Website</a><div class="side-foot">Developed by Aditya</div></div>
+<a class="nav" href="/" style="text-decoration:none">🌐 Website</a><div class="side-foot">Developed by RG CHEAT</div></div>
 <div id="main"><div id="top"><button class="a b" onclick="$('side').classList.toggle('open')">☰ Menu</button><b>Genius HostBot</b></div>
 <h2 id="ttl"></h2><div class="sub" id="st"></div><div id="view"></div></div><div id="toast"></div>
 <script>
@@ -2804,7 +2831,7 @@ footer{text-align:center;color:#6b7785;padding:28px 10px;font-size:13px;border-t
 <details><summary>Kaunsi files chalti hain?</summary><p>Python (.py) aur complete ZIP Python projects.</p></details>
 <details><summary>Problem aaye to?</summary><p>Telegram pe owner @Hackerwibes2 se contact karo.</p></details></section>
 <section><div class="cta"><h2 style="margin-bottom:8px">Ready to host? 🚀</h2><p style="color:#9aa7b5;margin:0 0 16px">Abhi Telegram pe bot kholo.</p><a class="btn p" href="__BOTLINK__">Open Bot</a></div></section>
-<footer>Developed by <b>Aditya (Genius Hacker)</b><br><a href="__YT__">YouTube</a>&bull;<a href="__CHANNEL__">Telegram Channel</a>&bull;<a href="https://t.me/__OWNER__">Contact</a></footer></body></html>"""
+<footer>Developed by <b>RG CHEAT</b><br><a href="__YT__">YouTube</a>&bull;<a href="__CHANNEL__">Telegram Channel</a>&bull;<a href="https://t.me/__OWNER__">Contact</a></footer></body></html>"""
 
 async def landing_page(request):
     global _BOT_USERNAME
@@ -2855,13 +2882,582 @@ async def web_server():
     await site.start()
     logger.info(f"🌐 Web server started on port {port}")
 
+
+# ═══════════════════════════════════════════════════════════════
+#  RG CHEAT — STABILITY · AUTO-RESTART · AUTO-START · AUTO-BACKUP
+# ═══════════════════════════════════════════════════════════════
+MAX_AUTO_RESTARTS = 5            # crash হলে সর্বোচ্চ কতবার auto-restart (backoff সহ)
+WATCHDOG_INTERVAL = 15           # সেকেন্ড
+MEM_GUARD_PERCENT = 90           # RAM এর বেশি হলে সবচেয়ে ভারী *normal user* বট বন্ধ হবে (admin বট না)
+AUTOSTART_STAGGER = 3            # রিস্টোরের সময় এক বট থেকে আরেক বটের মাঝে বিরতি
+BACKUP_INTERVAL = 3600           # প্রতি 1 ঘন্টা
+BACKUP_KEEP = 3                  # সার্ভারে প্রতি বটের শেষ কতটা ব্যাকআপ রাখবে
+BACKUP_SEND_TO_USERS = True      # ইউজারকেও তার নিজের বটের ব্যাকআপ পাঠাবে
+BACKUP_FULL_TO_OWNER = True      # Owner/Admin কে একটা FULL ব্যাকআপ (DB + সব বট)
+TG_UPLOAD_LIMIT = 49 * 1024 * 1024
+BACKUP_DIR = IROTECH_DIR / 'backups'
+BACKUP_SKIP_PARTS = {'__pycache__', '.venv', 'venv', 'site-packages', 'backups', '.git', 'node_modules'}
+
+_restarting = set()
+_cancelled = set()
+_bg_tasks = set()
+
+
+def _spawn(coro):
+    t = asyncio.create_task(coro)
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+    return t
+
+
+def _sql(sql, params=(), fetch=False):
+    conn = sqlite3.connect(DATABASE_PATH, timeout=20)
+    try:
+        cur = conn.execute(sql, params)
+        rows = cur.fetchall() if fetch else None
+        conn.commit()
+        return rows
+    finally:
+        conn.close()
+
+
+def _ensure_autostart_table():
+    _sql('CREATE TABLE IF NOT EXISTS autostart (user_id INTEGER, file_name TEXT, project_type TEXT, '
+         'saved_at TEXT, PRIMARY KEY (user_id, file_name))')
+
+
+def _script_key(user_id, file_name):
+    return f"{user_id}_{_project_id(user_id, file_name)}"
+
+
+def _autostart_save(user_id, file_name, project_type):
+    _cancelled.discard(_script_key(user_id, file_name))
+    try:
+        _sql('INSERT OR REPLACE INTO autostart (user_id, file_name, project_type, saved_at) VALUES (?,?,?,?)',
+             (user_id, file_name, project_type, datetime.now().isoformat()))
+    except Exception:
+        logger.exception('autostart save failed')
+
+
+def _autostart_remove(user_id, file_name):
+    if user_id is None or not file_name:
+        return
+    _cancelled.add(_script_key(user_id, file_name))
+    try:
+        _sql('DELETE FROM autostart WHERE user_id=? AND file_name=?', (user_id, file_name))
+    except Exception:
+        logger.exception('autostart remove failed')
+
+
+def _child_preexec():
+    """Hosted bot: কম priority + RAM কম পড়লে kernel আগে এটাকেই মারবে, মূল Host Bot কে না।"""
+    try:
+        os.nice(5)
+    except Exception:
+        pass
+    try:
+        with open('/proc/self/oom_score_adj', 'w') as f:
+            f.write('700')
+    except Exception:
+        pass
+
+
+def _read_int(path):
+    with open(path) as f:
+        return f.read().strip()
+
+
+def _mem_percent():
+    """Container (cgroup) এর আসল RAM ব্যবহার %, না পেলে পুরো সিস্টেমের।"""
+    try:
+        v2 = os.path.exists('/sys/fs/cgroup/memory.current')
+        cur_p = '/sys/fs/cgroup/memory.current' if v2 else '/sys/fs/cgroup/memory/memory.usage_in_bytes'
+        lim_p = '/sys/fs/cgroup/memory.max' if v2 else '/sys/fs/cgroup/memory/memory.limit_in_bytes'
+        if os.path.exists(cur_p) and os.path.exists(lim_p):
+            lim = _read_int(lim_p)
+            if lim != 'max' and int(lim) < (1 << 50):
+                cur = int(_read_int(cur_p))
+                stat_p = '/sys/fs/cgroup/memory.stat' if v2 else '/sys/fs/cgroup/memory/memory.stat'
+                cache = 0
+                try:
+                    for line in open(stat_p):
+                        k, _, v = line.partition(' ')
+                        if k in ('inactive_file', 'total_inactive_file'):
+                            cache = int(v)
+                            break
+                except Exception:
+                    pass
+                return max(0.0, (cur - cache) / int(lim) * 100)
+    except Exception:
+        pass
+    return psutil.virtual_memory().percent
+
+
+def _tree_rss(pid):
+    try:
+        p = psutil.Process(pid)
+        total = p.memory_info().rss
+        for c in p.children(recursive=True):
+            try:
+                total += c.memory_info().rss
+            except Exception:
+                pass
+        return total
+    except Exception:
+        return 0
+
+
+def _kill_tree(proc, timeout=6):
+    try:
+        if proc.poll() is None:
+            if os.name == 'nt':
+                proc.terminate()
+            else:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                if os.name == 'nt':
+                    proc.kill()
+                else:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                proc.wait(timeout=3)
+    except Exception:
+        pass
+
+
+async def _notify(uid, text):
+    try:
+        await bot.send_message(uid, text, parse_mode='HTML')
+    except Exception:
+        pass
+
+
+async def _notify_admins(text):
+    for uid in {OWNER_ID, ADMIN_ID}:
+        await _notify(uid, text)
+
+
+# ── headless start (no button press needed) ─────────────────────
+class _SilentMsg:
+    def __init__(self, sink):
+        self._sink = sink
+
+    async def edit_text(self, text=None, *a, **k):
+        if text:
+            self._sink['text'] = text
+        return self
+
+    async def answer(self, text=None, *a, **k):
+        if text:
+            self._sink['text'] = text
+        return self
+
+
+class _SilentCallback:
+    def __init__(self):
+        self.sink = {'text': ''}
+        self.message = _SilentMsg(self.sink)
+
+    async def answer(self, *a, **k):
+        return None
+
+
+async def _launch_by_name(user_id, file_name, project_type):
+    """একটা বট চালু করে (বাটন ছাড়াই). return (ok, message)."""
+    key = _script_key(user_id, file_name)
+    cb = _SilentCallback()
+    try:
+        file_path = UPLOAD_BOTS_DIR / str(user_id) / file_name
+        if not file_path.is_file():
+            return False, 'Source file not found'
+        project_dir = _project_workspace(user_id, file_name)
+        if project_type == 'zip':
+            if not project_dir.exists() or not any(project_dir.iterdir()):
+                if not zipfile.is_zipfile(file_path):
+                    return False, 'Invalid ZIP'
+                project_dir.mkdir(parents=True, exist_ok=True)
+                await asyncio.to_thread(_extract_project_archive, file_path, project_dir)
+            entry = _find_project_entry(project_dir)
+        else:
+            project_dir.mkdir(parents=True, exist_ok=True)
+            entry = project_dir / file_name
+            if not entry.exists():
+                shutil.copy2(file_path, entry)
+                user_folder = UPLOAD_BOTS_DIR / str(user_id)
+                for item in user_folder.iterdir():
+                    if item.is_file() and item.name != file_name and item.suffix.lower() not in ('.py', '.zip', '.log'):
+                        try:
+                            shutil.copy2(item, project_dir / item.name)
+                        except OSError:
+                            pass
+        await _start_python_process(user_id, file_name, entry, project_dir, project_type, cb)
+    except Exception as exc:
+        logger.exception('headless launch failed')
+        return False, f'{type(exc).__name__}: {exc}'
+    info = bot_scripts.get(key)
+    ok = bool(info and info['process'].poll() is None)
+    return ok, re.sub(r'<[^>]+>', '', cb.sink.get('text', ''))[:600]
+
+
+# ── auto-start everything that was running (boot / after update / after restore) ──
+async def _restore_all_bots(initial=False):
+    if initial:
+        await asyncio.sleep(8)
+    try:
+        rows = _sql('SELECT user_id, file_name, project_type FROM autostart', fetch=True) or []
+    except Exception:
+        logger.exception('autostart read failed')
+        return
+    if not rows:
+        return
+    rows.sort(key=lambda r: (r[0] not in admin_ids, r[0]))
+    started, failed = 0, []
+    logger.info(f"♻️ Auto-starting {len(rows)} saved bots...")
+    for uid, name, ptype in rows:
+        if uid in banned_users:
+            continue
+        key = _script_key(uid, name)
+        cur = bot_scripts.get(key)
+        if cur and cur['process'].poll() is None:
+            continue
+        for _ in range(12):               # RAM ভরে গেলে একটু অপেক্ষা
+            if _mem_percent() < 85:
+                break
+            await asyncio.sleep(5)
+        ok, text = await _launch_by_name(uid, name, ptype or 'py')
+        if ok:
+            started += 1
+        else:
+            failed.append((uid, name, text))
+            if 'not found' in text:
+                try:
+                    _sql('DELETE FROM autostart WHERE user_id=? AND file_name=?', (uid, name))
+                except Exception:
+                    pass
+        await asyncio.sleep(AUTOSTART_STAGGER)
+    msg = f"♻️ <b>Auto-Start complete</b>\n✅ Started: <b>{started}</b>\n❌ Failed: <b>{len(failed)}</b>"
+    for uid, name, text in failed[:10]:
+        msg += f"\n• <code>{uid}</code> / <code>{html_lib.escape(name)}</code> — {html_lib.escape(text[:80])}"
+    await _notify_admins(msg)
+
+
+# ── watchdog: crash হলে auto-restart, RAM guard, log trim ───────
+async def _auto_restart(key, info):
+    uid = info['script_owner_id']
+    name = info['file_name']
+    ptype = info.get('project_type', 'py')
+    _restarting.add(key)
+    try:
+        for attempt in range(MAX_AUTO_RESTARTS):
+            delay = min(5 * 2 ** attempt, 120) + (info.get('extra_delay', 0) if attempt == 0 else 0)
+            await asyncio.sleep(delay)
+            if key in _cancelled:
+                _cancelled.discard(key)
+                return
+            cur = bot_scripts.get(key)
+            if cur is not None and cur is not info and cur['process'].poll() is None:
+                return          # ইউজার নিজেই আবার চালু করেছে
+            ok, text = await _launch_by_name(uid, name, ptype)
+            if ok:
+                await _notify(uid, f"🔄 <b>{html_lib.escape(name)}</b> crash করেছিল — auto-restart হয়েছে ✅")
+                return
+            logger.warning(f"Auto-restart attempt {attempt + 1} failed for {name}: {text}")
+        stale = bot_scripts.get(key)
+        if stale is not None and stale['process'].poll() is not None:
+            h = stale.get('log_file')
+            if h and not h.closed:
+                h.close()
+            bot_scripts.pop(key, None)
+        _record_run(uid, name, ptype, 'CRASHED', info['start_time'], datetime.now(), info['process'].returncode, info.get('log_path'))
+        await _notify(uid, f"❌ <b>{html_lib.escape(name)}</b> বারবার crash করছে — auto-restart বন্ধ।\n"
+                           f"Logs দেখে code ঠিক করে আবার Run করুন।")
+        if uid not in admin_ids:
+            await _notify_admins(f"⚠️ User <code>{uid}</code> এর <code>{html_lib.escape(name)}</code> বারবার crash করছে।")
+    finally:
+        _restarting.discard(key)
+
+
+async def _watchdog_tick(tick):
+    pct = _mem_percent()
+    if pct >= MEM_GUARD_PERCENT:
+        cands = []
+        for key, info in list(bot_scripts.items()):
+            p = info.get('process')
+            if p and p.poll() is None and info.get('script_owner_id') not in admin_ids:
+                cands.append((_tree_rss(p.pid), key, info))
+        if cands:
+            rss, key, info = max(cands, key=lambda x: x[0])
+            await asyncio.to_thread(_kill_tree, info['process'])
+            info['extra_delay'] = 600
+            logger.warning(f"RAM {pct:.0f}% — stopped heaviest user bot {info['file_name']} ({rss // 1048576} MB)")
+            await _notify(info['script_owner_id'],
+                          f"⚠️ Server RAM full হওয়ায় <b>{html_lib.escape(info['file_name'])}</b> সাময়িক বন্ধ হয়েছে। "
+                          f"১০ মিনিট পর auto-start হবে।")
+
+    for key, info in list(bot_scripts.items()):
+        p = info.get('process')
+        if not p or p.poll() is None or key in _restarting:
+            continue
+        if p.returncode == 0:      # স্বাভাবিকভাবে শেষ হয়েছে (one-shot script)
+            h = info.get('log_file')
+            if h and not h.closed:
+                h.close()
+            _record_run(info['script_owner_id'], info['file_name'], info.get('project_type', 'py'),
+                        'FINISHED', info['start_time'], datetime.now(), 0, info.get('log_path'))
+            bot_scripts.pop(key, None)
+            _autostart_remove(info['script_owner_id'], info['file_name'])
+            continue
+        _spawn(_auto_restart(key, info))
+
+    if tick % 20 == 0:              # প্রতি ~5 মিনিটে log বেশি বড় হলে ছোট করে
+        for info in list(bot_scripts.values()):
+            lp = info.get('log_path')
+            try:
+                if lp and os.path.getsize(lp) > 8 * 1024 * 1024:
+                    with open(lp, 'rb') as f:
+                        f.seek(-1024 * 1024, 2)
+                        tail = f.read()
+                    with open(lp, 'r+b') as f:
+                        f.truncate(0)
+                    with open(lp, 'ab') as f:
+                        f.write(b'[LOG TRIMMED]\n' + tail)
+            except Exception:
+                pass
+
+
+async def _watchdog_loop():
+    tick = 0
+    while True:
+        await asyncio.sleep(WATCHDOG_INTERVAL)
+        tick += 1
+        try:
+            await _watchdog_tick(tick)
+        except Exception:
+            logger.exception('watchdog error')
+
+
+# ── auto-backup (প্রতি ঘন্টায়) ─────────────────────────────────
+def _iter_files(root: Path):
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in BACKUP_SKIP_PARTS]
+        for fn in filenames:
+            if fn.lower().endswith(('.log', '.pyc')):
+                continue
+            p = Path(dirpath) / fn
+            if p.is_file() and not p.is_symlink():
+                yield p
+
+
+def _prune(folder: Path, pattern: str, keep: int):
+    files = sorted(folder.glob(pattern), key=lambda x: x.stat().st_mtime, reverse=True)
+    for old in files[keep:]:
+        try:
+            old.unlink()
+        except Exception:
+            pass
+
+
+def _build_bot_backup(user_id, file_name):
+    src = UPLOAD_BOTS_DIR / str(user_id) / file_name
+    project_dir = _project_workspace(user_id, file_name)
+    if not src.is_file() and not project_dir.is_dir():
+        return None
+    out_dir = BACKUP_DIR / str(user_id) / _project_id(user_id, file_name)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"{Path(file_name).stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+    with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as zf:
+        if src.is_file():
+            zf.write(src, f"upload/{file_name}")
+        if project_dir.is_dir():
+            for f in _iter_files(project_dir):
+                try:
+                    zf.write(f, f"project/{f.relative_to(project_dir).as_posix()}")
+                except Exception:
+                    pass
+    _prune(out_dir, '*.zip', BACKUP_KEEP)
+    return out
+
+
+def _build_full_backup():
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    out = BACKUP_DIR / f"RG_FULL_BACKUP_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+    tmp_db = BACKUP_DIR / '_db_snapshot.db'
+    s = sqlite3.connect(DATABASE_PATH)
+    d = sqlite3.connect(tmp_db)
+    try:
+        s.backup(d)
+    finally:
+        d.close()
+        s.close()
+    with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as zf:
+        zf.write(tmp_db, 'bot_data.db')
+        if UPLOAD_BOTS_DIR.is_dir():
+            for f in _iter_files(UPLOAD_BOTS_DIR):
+                try:
+                    zf.write(f, 'upload_bots/' + f.relative_to(UPLOAD_BOTS_DIR).as_posix())
+                except Exception:
+                    pass
+    try:
+        tmp_db.unlink()
+    except Exception:
+        pass
+    _prune(BACKUP_DIR, 'RG_FULL_BACKUP_*.zip', 2)
+    return out
+
+
+async def _send_doc(chat_id, path, caption):
+    for _ in range(2):
+        try:
+            await bot.send_document(chat_id, FSInputFile(path), caption=caption)
+            return True
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except Exception as e:
+            logger.warning(f"backup send to {chat_id} failed: {e}")
+            return False
+    return False
+
+
+async def _run_backup_cycle():
+    recipients = {OWNER_ID, ADMIN_ID}
+    now_txt = datetime.now().strftime('%d %b %Y %H:%M')
+    sent = skipped = 0
+    if BACKUP_FULL_TO_OWNER:
+        try:
+            full = await asyncio.to_thread(_build_full_backup)
+            if full.stat().st_size <= TG_UPLOAD_LIMIT:
+                for r in recipients:
+                    if await _send_doc(r, full, f"💾 FULL BACKUP\n🕒 {now_txt}\n\nRestore: এই ZIP ফাইলটা বটে (Admin হিসেবে) আপলোড করুন — সব বট আবার auto-start হবে।"):
+                        sent += 1
+                    await asyncio.sleep(1.1)
+            else:
+                skipped += 1
+                await _notify_admins("⚠️ Full backup 49MB এর বেশি — Telegram এ পাঠানো যায়নি। সার্ভারে সেভ আছে। Per-bot backup পাঠানো হচ্ছে।")
+        except Exception:
+            logger.exception('full backup failed')
+    for uid, files in list(user_files.items()):
+        for file_name, _ftype in list(files):
+            try:
+                path = await asyncio.to_thread(_build_bot_backup, uid, file_name)
+            except Exception:
+                logger.exception('bot backup failed')
+                continue
+            if not path:
+                continue
+            if path.stat().st_size > TG_UPLOAD_LIMIT:
+                skipped += 1
+                continue
+            info = bot_scripts.get(_script_key(uid, file_name))
+            running = bool(info and info['process'].poll() is None)
+            caption = (f"💾 Auto Backup\n👤 User: {uid}\n📄 Bot: {file_name}\n"
+                       f"{'🟢 Running' if running else '⚪ Stopped'}\n🕒 {now_txt}")
+            targets = set(recipients)
+            if BACKUP_SEND_TO_USERS and uid not in banned_users:
+                targets.add(uid)
+            for t in targets:
+                if await _send_doc(t, path, caption):
+                    sent += 1
+                await asyncio.sleep(1.1)
+    logger.info(f"💾 Backup cycle done: sent={sent} skipped={skipped}")
+
+
+async def _backup_loop():
+    await asyncio.sleep(300)
+    while True:
+        try:
+            await _run_backup_cycle()
+        except Exception:
+            logger.exception('backup cycle error')
+        await asyncio.sleep(BACKUP_INTERVAL)
+
+
+async def _restore_full_backup(message: types.Message, document):
+    tmp = IROTECH_DIR / 'restore_upload.zip'
+    status = await message.answer("♻️ <b>Restoring full backup...</b>", parse_mode="HTML")
+    try:
+        await bot.download(document, destination=tmp)
+
+        def _do():
+            count = 0
+            with zipfile.ZipFile(tmp) as zf:
+                if 'bot_data.db' not in zf.namelist():
+                    raise ValueError('এটা valid RG_FULL_BACKUP ফাইল না (bot_data.db নেই)')
+                for item in zf.infolist():
+                    if item.is_dir():
+                        continue
+                    if item.filename == 'bot_data.db':
+                        if DATABASE_PATH.exists():
+                            shutil.copy2(DATABASE_PATH, str(DATABASE_PATH) + '.bak')
+                        with zf.open(item) as s, open(DATABASE_PATH, 'wb') as d:
+                            shutil.copyfileobj(s, d)
+                    elif item.filename.startswith('upload_bots/'):
+                        dest = _safe_child_path(UPLOAD_BOTS_DIR, item.filename[len('upload_bots/'):])
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        with zf.open(item) as s, open(dest, 'wb') as d:
+                            shutil.copyfileobj(s, d)
+                        count += 1
+            return count
+
+        count = await asyncio.to_thread(_do)
+        user_subscriptions.clear(); user_files.clear(); user_favorites.clear()
+        active_users.clear(); banned_users.clear()
+        admin_ids.clear(); admin_ids.update({ADMIN_ID, OWNER_ID})
+        init_db(); migrate_db(); _ensure_autostart_table(); load_data()
+        n = len(_sql('SELECT 1 FROM autostart', fetch=True) or [])
+        await status.edit_text(f"✅ <b>Restore complete</b>\n📁 Files restored: <b>{count}</b>\n"
+                               f"🤖 Bots to auto-start: <b>{n}</b>\n\nএকে একে সব বট চালু হচ্ছে...", parse_mode="HTML")
+        _spawn(_restore_all_bots())
+    except Exception as exc:
+        logger.exception('restore failed')
+        await status.edit_text(f"❌ Restore failed: {html_lib.escape(str(exc)[:300])}\n\n"
+                               f"(Bot API দিয়ে সর্বোচ্চ 20MB ফাইল ডাউনলোড করা যায়)", parse_mode="HTML")
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+@dp.message(Command("backup"))
+async def cmd_backup_now(message: types.Message):
+    if message.from_user.id not in admin_ids:
+        return
+    await message.answer("💾 Backup শুরু হচ্ছে... সব বটের ব্যাকআপ আসবে।")
+    _spawn(_run_backup_cycle())
+
+
+@dp.message(Command("startall"))
+async def cmd_start_all_bots(message: types.Message):
+    if message.from_user.id not in admin_ids:
+        return
+    await message.answer("♻️ সেভ করা সব বট আবার চালু করা হচ্ছে...")
+    _spawn(_restore_all_bots())
+
+
 async def main():
     logger.info("🚀 Starting Advanced File Host Bot...")
-    
-    asyncio.create_task(web_server())
-    asyncio.create_task(keep_alive())
-    
-    await dp.start_polling(bot)
+    _ensure_autostart_table()
+
+    _spawn(web_server())
+    _spawn(keep_alive())
+    _spawn(_watchdog_loop())
+    _spawn(_backup_loop())
+    _spawn(_restore_all_bots(initial=True))
+
+    while True:      # polling কখনো ক্র্যাশ করলে নিজে আবার চালু হবে
+        try:
+            await dp.start_polling(bot)
+            break
+        except Exception:
+            logger.exception("Polling crashed — restarting in 5s")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
     asyncio.run(main())
